@@ -11,11 +11,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import record_audit_event
 from app.core.rbac import require_permission
 from app.core.security import secret_manager
-from app.core.validators import escape_sql_string_literal, validate_db_identifier
+from app.core.validators import (
+    escape_sql_string_literal,
+    validate_db_host,
+    validate_db_identifier,
+    validate_mysql_charset,
+)
 from app.db.models import BackupManifest, ManagedDatabase, PanelSetting, User
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
+from app.services.backups import backup_all_databases
+from app.services.databases import (
+    drop_database,
+    dump_database,
+    import_sql as import_sql_stream,
+    provision_database,
+)
 from app.services.executor import get_node_executor
+from app.services.scheduler import schedule_db_auto_backup, unschedule_db_auto_backup, validate_cron_expression
 
 router = APIRouter(prefix="/databases", tags=["Database Administration"])
 
@@ -36,6 +49,31 @@ def _mariadb_sql(statement: str) -> str:
 
 def _postgres_sql(statement: str) -> str:
     return f"{POSTGRES_SESSION_PREFIX} {statement}"
+
+
+async def _get_setting_json(db: AsyncSession, key: str) -> dict:
+    row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+    if not row:
+        return {}
+    try:
+        return json.loads(row.value)
+    except Exception:
+        return {}
+
+
+async def _set_setting_json(db: AsyncSession, key: str, updates: dict, *, is_secret: bool = False) -> None:
+    row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+    meta = {}
+    if row:
+        try:
+            meta = json.loads(row.value)
+        except Exception:
+            meta = {}
+    meta.update(updates)
+    if row:
+        row.value = json.dumps(meta)
+    else:
+        db.add(PanelSetting(key=key, value=json.dumps(meta), is_secret=is_secret))
 
 
 async def _get_db_meta(db: AsyncSession, engine: str, db_name: str) -> dict:
@@ -78,6 +116,16 @@ class DatabaseCreate(BaseModel):
     @classmethod
     def check_ident(cls, v: str) -> str:
         return validate_db_identifier(v)
+
+    @field_validator("db_host")
+    @classmethod
+    def check_host(cls, v: str) -> str:
+        return validate_db_host(v)
+
+    @field_validator("charset")
+    @classmethod
+    def check_charset(cls, v: str) -> str:
+        return validate_mysql_charset(v)
 
 
 class PasswordRotateRequest(BaseModel):
@@ -195,22 +243,15 @@ async def create_database(
         raise HTTPException(status_code=409, detail="Database already exists")
 
     executor = get_node_executor()
-    safe_pw = escape_sql_string_literal(body.db_password)
-    if body.engine == "mariadb":
-        sql = _mariadb_sql(
-            f"CREATE DATABASE IF NOT EXISTS `{body.db_name}` CHARACTER SET {body.charset}; "
-            f"CREATE USER IF NOT EXISTS '{body.db_user}'@'{body.db_host}' IDENTIFIED BY '{safe_pw}'; "
-            f"GRANT ALL PRIVILEGES ON `{body.db_name}`.* TO '{body.db_user}'@'{body.db_host}'; "
-            "FLUSH PRIVILEGES;"
-        )
-        res = await executor.run_command(["/usr/bin/mariadb", "-e", sql])
-    else:
-        sql = _postgres_sql(
-            f"DO $$ BEGIN CREATE USER {body.db_user} WITH PASSWORD '{safe_pw}'; "
-            f"EXCEPTION WHEN duplicate_object THEN ALTER USER {body.db_user} WITH PASSWORD '{safe_pw}'; END $$; "
-            f"CREATE DATABASE {body.db_name} OWNER {body.db_user};"
-        )
-        res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", sql])
+    res = await provision_database(
+        executor,
+        engine=body.engine,
+        db_name=body.db_name,
+        db_user=body.db_user,
+        db_password=body.db_password,
+        db_host=body.db_host,
+        charset=body.charset,
+    )
 
     if not res.ok:
         raise HTTPException(status_code=500, detail=f"Database provisioning failed: {res.stderr}")
@@ -294,12 +335,21 @@ async def drop_database(
         raise HTTPException(status_code=404, detail="Database not found")
 
     executor = get_node_executor()
-    if rec.engine == "mariadb":
-        sql = f"DROP DATABASE IF EXISTS `{rec.db_name}`; DROP USER IF EXISTS '{rec.db_user}'@'{rec.db_host}';"
-        await executor.run_command(["/usr/bin/mariadb", "-e", sql])
-    else:
-        await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", f"DROP DATABASE IF EXISTS {rec.db_name};"])
+    res = await drop_database(
+        executor,
+        engine=rec.engine,
+        db_name=rec.db_name,
+        db_user=rec.db_user,
+        db_host=rec.db_host,
+    )
 
+    if not res.ok:
+        raise HTTPException(status_code=500, detail=f"Database removal failed: {res.stderr or res.stdout}")
+
+    meta_key = f"db_meta:{rec.engine}:{rec.db_name}"
+    meta_row = (await db.execute(select(PanelSetting).where(PanelSetting.key == meta_key))).scalar_one_or_none()
+    if meta_row:
+        await db.delete(meta_row)
     await db.delete(rec)
     await record_audit_event(
         db,
@@ -314,7 +364,7 @@ async def drop_database(
 
 
 class SqlImportRequest(BaseModel):
-    sql_content: str = Field(min_length=1)
+    sql_content: str = Field(min_length=1, max_length=64 * 1024 * 1024)
 
 
 @router.post("/{db_id}/import")
@@ -329,10 +379,7 @@ async def import_sql(
     if not rec:
         raise HTTPException(status_code=404, detail="Database not found")
     executor = get_node_executor()
-    if rec.engine == "mariadb":
-        res = await executor.run_command(["/usr/bin/mariadb", rec.db_name, "-e", body.sql_content])
-    else:
-        res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-d", rec.db_name, "-c", body.sql_content])
+    res = await import_sql_stream(executor, engine=rec.engine, db_name=rec.db_name, sql_content=body.sql_content)
     await record_audit_event(
         db, actor=actor, request=request, permission="databases:write", action="import_sql", target_resource=f"{rec.engine}:{rec.db_name}"
     )
@@ -343,17 +390,26 @@ async def import_sql(
 @router.get("/{db_id}/export")
 async def export_sql(
     db_id: int,
-    _: User = Depends(require_permission("databases:read")),
+    request: Request,
+    actor: User = Depends(require_permission("databases:read")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     rec = (await db.execute(select(ManagedDatabase).where(ManagedDatabase.id == db_id))).scalar_one_or_none()
     if not rec:
         raise HTTPException(status_code=404, detail="Database not found")
     executor = get_node_executor()
-    if rec.engine == "mariadb":
-        res = await executor.run_command(["/usr/bin/mariadb-dump", rec.db_name])
-    else:
-        res = await executor.run_command(["/usr/bin/pg_dump", "-U", "postgres", rec.db_name])
+    res = await dump_database(executor, engine=rec.engine, db_name=rec.db_name)
+    if not res.ok:
+        raise HTTPException(status_code=500, detail=f"Database export failed: {res.stderr or res.stdout}")
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="databases:read",
+        action="export_database",
+        target_resource=f"{rec.engine}:{rec.db_name}",
+    )
+    await db.commit()
     return {"db_name": rec.db_name, "engine": rec.engine, "dump": res.stdout, "ok": res.ok}
 
 
@@ -422,7 +478,8 @@ async def sync_databases_from_server(
 @router.get("/{db_id}/password/reveal")
 async def reveal_database_password(
     db_id: int,
-    _: User = Depends(require_permission("databases:read")),
+    request: Request,
+    actor: User = Depends(require_permission("databases:write")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     rec = (await db.execute(select(ManagedDatabase).where(ManagedDatabase.id == db_id))).scalar_one_or_none()
@@ -433,9 +490,19 @@ async def reveal_database_password(
     if not enc:
         return {"password": None}
     try:
-        return {"password": secret_manager.decrypt(enc)}
+        password = secret_manager.decrypt(enc)
     except Exception:
         return {"password": None}
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="databases:write",
+        action="reveal_db_password",
+        target_resource=f"{rec.engine}:{rec.db_name}",
+    )
+    await db.commit()
+    return {"password": password}
 
 
 @router.put("/{db_id}/permission")
@@ -450,12 +517,10 @@ async def update_database_permission(
     if not rec:
         raise HTTPException(status_code=404, detail="Database not found")
 
-    new_host = body.db_host.strip()
-    if any(ch in new_host for ch in ("'", ";", "`", " ")):
-        raise HTTPException(status_code=400, detail="Invalid host specification")
+    new_host = validate_db_host(body.db_host)
 
     executor = get_node_executor()
-    if rec.engine == "mariadb" and new_host != rec.db_host:
+    if rec.engine == "mariadb":
         meta = await _get_db_meta(db, rec.engine, rec.db_name)
         pw = ""
         if meta.get("password_enc"):
@@ -463,17 +528,22 @@ async def update_database_permission(
                 pw = escape_sql_string_literal(secret_manager.decrypt(meta["password_enc"]))
             except Exception:
                 pw = ""
-        if pw:
-            sql = _mariadb_sql(
-                f"CREATE USER IF NOT EXISTS '{rec.db_user}'@'{new_host}' IDENTIFIED BY '{pw}'; "
-                f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; "
-                "FLUSH PRIVILEGES;"
-            )
-        else:
-            sql = _mariadb_sql(
-                f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; FLUSH PRIVILEGES;"
-            )
-        await executor.run_command(["/usr/bin/mariadb", "-e", sql])
+        if not pw:
+            raise HTTPException(status_code=400, detail="Cannot change host without a stored password; rotate the password first")
+        sql = _mariadb_sql(
+            f"CREATE USER IF NOT EXISTS '{rec.db_user}'@'{new_host}' IDENTIFIED BY '{pw}'; "
+            f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; "
+            "FLUSH PRIVILEGES;"
+        )
+        res = await executor.run_command(["/usr/bin/mariadb", "-e", sql])
+        if not res.ok:
+            raise HTTPException(status_code=500, detail=f"Permission update failed: {res.stderr}")
+        if new_host != rec.db_host:
+            await executor.run_command(["/usr/bin/mariadb", "-e", _mariadb_sql(f"DROP USER IF EXISTS '{rec.db_user}'@'{rec.db_host}'; FLUSH PRIVILEGES;"]))
+
+    else:
+        # PostgreSQL has no host-based grants; only record the requested host.
+        pass
 
     rec.db_host = new_host
     await record_audit_event(
@@ -487,13 +557,22 @@ async def update_database_permission(
 async def update_database_note(
     db_id: int,
     body: NoteUpdateRequest,
-    _: User = Depends(require_permission("databases:write")),
+    request: Request,
+    actor: User = Depends(require_permission("databases:write")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     rec = (await db.execute(select(ManagedDatabase).where(ManagedDatabase.id == db_id))).scalar_one_or_none()
     if not rec:
         raise HTTPException(status_code=404, detail="Database not found")
     await _set_db_meta(db, rec.engine, rec.db_name, {"note": body.note})
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="databases:write",
+        action="update_db_note",
+        target_resource=f"{rec.engine}:{rec.db_name}",
+    )
     await db.commit()
     return {"ok": True, "note": body.note}
 
