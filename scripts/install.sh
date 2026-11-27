@@ -116,6 +116,7 @@ fi
 # 4. Acquire NexoPanel Source (Git Repo OR Local/Release Package)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+cd "$NEXOPANEL_HOME" || cd /tmp
 
 if [[ -n "$GIT_REPO" ]]; then
   log "Cloning/updating NexoPanel from Git repository: ${GIT_REPO} (${GIT_BRANCH})..."
@@ -164,11 +165,11 @@ if [[ -d "${NEXOPANEL_HOME}/frontend" ]] && { [[ "$REBUILD_FRONTEND" -eq 1 ]] ||
   if [[ -d "${NEXOPANEL_HOME}/frontend/node_modules" && ! -x "${NEXOPANEL_HOME}/frontend/node_modules/.bin/nuxt" ]]; then
     rm -rf "${NEXOPANEL_HOME}/frontend/node_modules"
   fi
-  npm --prefix "${NEXOPANEL_HOME}/frontend" install --no-audit --no-fund --ignore-scripts
-  chmod -R a+rX "${NEXOPANEL_HOME}/frontend/node_modules" 2>/dev/null || true
-  find "${NEXOPANEL_HOME}/frontend/node_modules" -type f \( -path "*/.bin/*" -o -path "*/bin/*" -o -name "esbuild" \) -exec chmod +x {} + 2>/dev/null || true
   (
     cd "${NEXOPANEL_HOME}/frontend"
+    npm install --no-audit --no-fund --ignore-scripts
+    chmod -R a+rX "${NEXOPANEL_HOME}/frontend/node_modules" 2>/dev/null || true
+    find "${NEXOPANEL_HOME}/frontend/node_modules" -type f \( -path "*/.bin/*" -o -path "*/bin/*" -o -name "esbuild" \) -exec chmod +x {} + 2>/dev/null || true
     node ./node_modules/nuxt/bin/nuxt.mjs prepare
     node ./node_modules/nuxt/bin/nuxt.mjs generate
   )
