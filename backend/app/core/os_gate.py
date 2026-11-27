@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SUPPORTED_OS_VERSIONS: dict[str, set[str]] = {
-    "ubuntu": {"22.04", "24.04"},
+    "ubuntu": {"22.04", "24.04", "26.04"},
     "debian": {"12"},
 }
 
@@ -71,7 +71,7 @@ def validate_host_environment(
     if not supported_versions or info.version_id not in supported_versions:
         raise UnsupportedOSError(
             f"Unsupported OS '{info.pretty_name}' (ID={info.distro_id}, VERSION_ID={info.version_id}). "
-            "Supported targets: Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Debian 12 (Bookworm)."
+            "Supported targets: Ubuntu 22.04/24.04/26.04 LTS, Debian 12 (Bookworm)."
         )
 
     return info

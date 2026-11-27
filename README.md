@@ -19,7 +19,7 @@ NexoPanel manages a single Linux host (`localhost`) in this release. Every domai
   * **Databases:** MariaDB/MySQL and PostgreSQL.
 
 ### 3. Supported Operating Systems
-* **Ubuntu 22.04 LTS**, **Ubuntu 24.04 LTS**, and **Debian 12 (Bookworm)** on `x86_64` and `aarch64`.
+* **Ubuntu 22.04 LTS**, **Ubuntu 24.04 LTS**, **Ubuntu 26.04 LTS**, and **Debian 12 (Bookworm)** on `x86_64` and `aarch64`.
 * Both `scripts/install.sh` and FastAPI startup (`app/core/os_gate.py`) strictly validate `/etc/os-release` and abort with a non-zero exit code on unsupported distributions.
 
 ---
@@ -54,7 +54,23 @@ npm install
 npm run dev
 ```
 
-### Production Installation (Ubuntu 22.04/24.04 or Debian 12)
+### Production Installation (Ubuntu 22.04 / 24.04 / 26.04 LTS or Debian 12)
+
+**Option A — Install directly from your Git repository:**
 ```bash
+git clone https://github.com/<your-org>/nexopanel.git
+cd nexopanel
 sudo bash scripts/install.sh
+```
+Or one-line remote install:
+```bash
+curl -fsSL https://raw.githubusercontent.com/<your-org>/nexopanel/main/scripts/install.sh | sudo bash -s -- --repo https://github.com/<your-org>/nexopanel.git
+```
+
+**Option B — Build & install a self-contained release tarball:**
+```bash
+bash scripts/build-package.sh 1.0.0
+scp dist/nexopanel-1.0.0-linux.tar.gz root@your-server:/root/
+# On target server:
+tar -xzf nexopanel-1.0.0-linux.tar.gz && cd nexopanel-1.0.0 && sudo bash scripts/install.sh
 ```

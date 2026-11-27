@@ -31,6 +31,16 @@ def test_os_gate_accepts_ubuntu_2404(tmp_path: Path):
         assert info.version_id == "24.04"
 
 
+def test_os_gate_accepts_ubuntu_2604(tmp_path: Path):
+    os_rel = tmp_path / "os-release"
+    os_rel.write_text('ID=ubuntu\nVERSION_ID="26.04"\nPRETTY_NAME="Ubuntu 26.04.1 LTS"\n')
+    with patch("platform.machine", return_value="x86_64"):
+        info = validate_host_environment(os_release_path=os_rel, skip_check=False)
+        assert info is not None
+        assert info.distro_id == "ubuntu"
+        assert info.version_id == "26.04"
+
+
 def test_os_gate_rejects_unsupported_distro(tmp_path: Path):
     os_rel = tmp_path / "os-release"
     os_rel.write_text('ID=centos\nVERSION_ID="7"\nPRETTY_NAME="CentOS 7"\n')

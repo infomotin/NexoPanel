@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
 from app.core.config import settings
@@ -57,3 +60,22 @@ app.include_router(api_router)
 @app.get("/health")
 async def health_check() -> dict[str, str]:
     return {"status": "ok", "app": settings.APP_NAME, "version": settings.APP_VERSION}
+
+
+# Serve pre-built Nuxt 3 static SPA if present (single-port deployment on :8443)
+_FRONTEND_DIST = Path(__file__).resolve().parents[2].parent / "frontend" / ".output" / "public"
+if _FRONTEND_DIST.is_dir():
+    if (_FRONTEND_DIST / "_nuxt").is_dir():
+        app.mount("/_nuxt", StaticFiles(directory=str(_FRONTEND_DIST / "_nuxt")), name="nuxt-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        candidate = _FRONTEND_DIST / full_path
+        if candidate.is_file():
+            return FileResponse(str(candidate))
+        index_html = _FRONTEND_DIST / "index.html"
+        if index_html.is_file():
+            return FileResponse(str(index_html))
+        raise HTTPException(status_code=404, detail="Frontend not built")

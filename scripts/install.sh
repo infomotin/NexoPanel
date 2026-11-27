@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NexoPanel Idempotent One-Line Installer
-# Supported Targets: Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Debian 12 (Bookworm) [x86_64, aarch64]
+# NexoPanel Idempotent One-Line Installer (Git Repo & Release Package Ready)
+# Supported Targets: Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Ubuntu 26.04 LTS, Debian 12 (Bookworm) [x86_64, aarch64]
 
 NEXOPANEL_HOME="/opt/nexopanel"
 NEXOPANEL_DATA="/var/lib/nexopanel"
@@ -13,10 +13,29 @@ NEXOPANEL_BACKUP="/var/backups/nexopanel"
 MIN_RAM_MB=1024
 MIN_DISK_GB=10
 
+GIT_REPO="${NEXOPANEL_GIT_REPO:-}"
+GIT_BRANCH="${NEXOPANEL_GIT_BRANCH:-main}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)
+      GIT_REPO="$2"
+      shift 2
+      ;;
+    --branch)
+      GIT_BRANCH="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
 log() { echo -e "\033[1;32m[NexoPanel]\033[0m $*"; }
 err() { echo -e "\033[1;31m[FATAL]\033[0m $*" >&2; exit 1; }
 
-# 1. Root & Hardware & OS Validation
+# 1. Root, Architecture, OS & Hardware Validation
 if [[ $EUID -ne 0 ]]; then
   err "install.sh must be executed as root."
 fi
@@ -36,11 +55,11 @@ OS_ID="${ID,,}"
 OS_VER="${VERSION_ID:-}"
 
 case "${OS_ID}:${OS_VER}" in
-  ubuntu:22.04|ubuntu:24.04|debian:12)
+  ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:12)
     log "Verified supported OS: ${PRETTY_NAME} (${ARCH})"
     ;;
   *)
-    err "Unsupported OS: ${PRETTY_NAME:-unknown} (ID=${OS_ID}, VERSION_ID=${OS_VER}). Supported: Ubuntu 22.04/24.04, Debian 12."
+    err "Unsupported OS: ${PRETTY_NAME:-unknown} (ID=${OS_ID}, VERSION_ID=${OS_VER}). Supported: Ubuntu 22.04/24.04/26.04 LTS, Debian 12."
     ;;
 esac
 
@@ -54,7 +73,7 @@ if (( AVAIL_DISK_GB < MIN_DISK_GB )); then
   err "Insufficient free disk space (${AVAIL_DISK_GB} GB). Minimum required: ${MIN_DISK_GB} GB."
 fi
 
-# 2. Non-interactive Package Installation
+# 2. Non-interactive Package Installation (Minimized Ubuntu/Debian safe)
 export DEBIAN_FRONTEND=noninteractive
 log "Updating apt package index..."
 apt-get update -qq
@@ -62,14 +81,15 @@ apt-get update -qq
 echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections
 echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
 
-log "Installing delegated OS services (Nginx, Postfix, Dovecot, OpenDKIM, Bind9, MariaDB, PostgreSQL, Certbot, Python3)..."
+log "Installing delegated OS services & runtime dependencies..."
 apt-get install -y -q \
+  ca-certificates curl git tar unzip gnupg lsb-release \
   nginx php-fpm \
   postfix postfix-pcre dovecot-core dovecot-imapd dovecot-pop3d opendkim opendkim-tools \
   bind9 bind9utils \
   mariadb-server postgresql \
-  certbot python3 python3-venv python3-pip \
-  curl tar unzip
+  ufw fail2ban \
+  certbot python3 python3-venv python3-pip
 
 # 3. Create unprivileged system user & directories
 if ! id -u nexopanel >/dev/null 2>&1; then
@@ -80,28 +100,60 @@ mkdir -p "$NEXOPANEL_HOME" "$NEXOPANEL_DATA" "$NEXOPANEL_ETC" "$NEXOPANEL_RUN" "
 chown -R nexopanel:nexopanel "$NEXOPANEL_DATA" "$NEXOPANEL_LOG" "$NEXOPANEL_BACKUP" "$NEXOPANEL_RUN"
 chmod 750 "$NEXOPANEL_ETC"
 
-# Master Fernet key (root-owned 0600)
 if [[ ! -f "${NEXOPANEL_ETC}/master.key" ]]; then
   python3 -c 'import secrets, base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())' > "${NEXOPANEL_ETC}/master.key"
   chmod 0600 "${NEXOPANEL_ETC}/master.key"
   chown nexopanel:nexopanel "${NEXOPANEL_ETC}/master.key"
 fi
 
-# 4. Python Virtual Environment & Backend Installation
+# 4. Acquire NexoPanel Source (Git Repo OR Local/Release Package)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-if [[ -d "${REPO_ROOT}/backend" ]]; then
+if [[ -n "$GIT_REPO" ]]; then
+  log "Cloning/updating NexoPanel from Git repository: ${GIT_REPO} (${GIT_BRANCH})..."
+  if [[ -d "${NEXOPANEL_HOME}/.git" ]]; then
+    git -C "$NEXOPANEL_HOME" fetch --all --prune
+    git -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
+    git -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
+  else
+    rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
+    git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
+  fi
+elif [[ -d "${REPO_ROOT}/backend" ]]; then
+  log "Installing NexoPanel from local source/package (${REPO_ROOT})..."
+  rm -rf "${NEXOPANEL_HOME}/backend" "${NEXOPANEL_HOME}/frontend"
   cp -r "${REPO_ROOT}/backend" "${NEXOPANEL_HOME}/"
+  if [[ -d "${REPO_ROOT}/frontend" ]]; then
+    cp -r "${REPO_ROOT}/frontend" "${NEXOPANEL_HOME}/"
+  fi
+else
+  err "No backend directory found and no --repo <git-url> specified."
 fi
 
+# 5. Build Frontend Static Bundle if not pre-packaged
+if [[ -d "${NEXOPANEL_HOME}/frontend" && ! -d "${NEXOPANEL_HOME}/frontend/.output/public" ]]; then
+  if ! command -v node >/dev/null 2>&1 || (( $(node -v | sed 's/v\([0-9]*\).*/\1/') < 20 )); then
+    log "Installing Node.js 22 LTS for frontend build..."
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y -q nodejs
+  fi
+  log "Building Nuxt 3 static frontend bundle..."
+  SERVER_IP="$(hostname -I | awk '{print $1}')"
+  export NUXT_PUBLIC_API_BASE="/api/v1"
+  export NUXT_PUBLIC_WS_BASE="ws://${SERVER_IP}:8443/api/v1"
+  npm --prefix "${NEXOPANEL_HOME}/frontend" install --no-audit --no-fund
+  npm --prefix "${NEXOPANEL_HOME}/frontend" run generate
+fi
+
+# 6. Python Virtual Environment & Backend Dependencies
 if [[ ! -d "${NEXOPANEL_HOME}/venv" ]]; then
   python3 -m venv "${NEXOPANEL_HOME}/venv"
 fi
 "${NEXOPANEL_HOME}/venv/bin/pip" install --quiet --upgrade pip
 "${NEXOPANEL_HOME}/venv/bin/pip" install --quiet -r "${NEXOPANEL_HOME}/backend/requirements.txt"
 
-# 5. Bootstrap SQLite WAL Schema & Initial Admin Credentials
+# 7. Bootstrap SQLite WAL Schema & Initial Admin Credentials
 INIT_ADMIN_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
 PYTHONPATH="${NEXOPANEL_HOME}/backend" \
 NEXOPANEL_DATABASE_PATH="${NEXOPANEL_DATA}/panel.db" \
@@ -120,7 +172,7 @@ asyncio.run(main())
 PYEOF
 chown nexopanel:nexopanel "${NEXOPANEL_DATA}/panel.db"*
 
-# 6. Install systemd units (nexopanel-daemon.service & nexopanel.service)
+# 8. Install systemd units (nexopanel-daemon.service & nexopanel.service)
 cat > /etc/systemd/system/nexopanel-daemon.service <<EOF
 [Unit]
 Description=NexoPanel Privileged Root Execution Daemon
@@ -139,7 +191,7 @@ EOF
 
 cat > /etc/systemd/system/nexopanel.service <<EOF
 [Unit]
-Description=NexoPanel Control Plane API
+Description=NexoPanel Control Plane API & UI
 After=network.target nexopanel-daemon.service
 Requires=nexopanel-daemon.service
 
@@ -159,7 +211,12 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now nginx mariadb postgresql postfix dovecot bind9 nexopanel-daemon nexopanel
+systemctl enable --now nginx mariadb postgresql postfix dovecot bind9 fail2ban nexopanel-daemon nexopanel
+
+# Open panel port in UFW if active
+if ufw status | grep -q "Status: active"; then
+  ufw allow 8443/tcp >/dev/null 2>&1 || true
+fi
 
 SERVER_IP="$(hostname -I | awk '{print $1}')"
 echo ""
