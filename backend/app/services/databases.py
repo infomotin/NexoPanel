@@ -16,7 +16,12 @@ import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.validators import escape_sql_string_literal
+from app.core.validators import (
+    escape_sql_string_literal,
+    validate_db_host,
+    validate_db_identifier,
+    validate_mysql_charset,
+)
 from app.db.models import PanelSetting
 from app.services.executor import ExecutionResult, NodeExecutor
 
@@ -43,7 +48,12 @@ async def provision_database(
     charset: str = "utf8mb4",
 ) -> ExecutionResult:
     """Create the database, its owning user and the grants for that user."""
+    db_name = validate_db_identifier(db_name)
+    db_user = validate_db_identifier(db_user)
+    db_host = validate_db_host(db_host)
+    charset = validate_mysql_charset(charset)
     safe_pw = escape_sql_string_literal(db_password)
+
     if engine == "mariadb":
         sql = mariadb_sql(
             f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET {charset}; "
@@ -52,12 +62,66 @@ async def provision_database(
             "FLUSH PRIVILEGES;"
         )
         return await executor.run_command(["/usr/bin/mariadb", "-e", sql])
-    sql = postgres_sql(
+
+    # PostgreSQL: CREATE DATABASE cannot run inside a transaction block, and a
+    # multi-statement `psql -c` string is executed as one implicit transaction.
+    # Create the role first, then the database, then grant in separate calls.
+    role_sql = postgres_sql(
         f"DO $$ BEGIN CREATE USER {db_user} WITH PASSWORD '{safe_pw}'; "
-        f"EXCEPTION WHEN duplicate_object THEN ALTER USER {db_user} WITH PASSWORD '{safe_pw}'; END $$; "
-        f"CREATE DATABASE {db_name} OWNER {db_user};"
+        f"EXCEPTION WHEN duplicate_object THEN ALTER USER {db_user} WITH PASSWORD '{safe_pw}'; END $$;"
     )
-    return await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", sql])
+    res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", role_sql])
+    if not res.ok:
+        return res
+
+    res = await executor.run_command(
+        ["/usr/bin/psql", "-U", "postgres", "-c", f"CREATE DATABASE {db_name} OWNER {db_user};"]
+    )
+    if not res.ok and "already exists" not in (res.stderr or "").lower():
+        return res
+
+    return await executor.run_command(
+        [
+            "/usr/bin/psql",
+            "-U",
+            "postgres",
+            "-c",
+            f"GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {db_user};",
+        ]
+    )
+
+
+async def drop_database(
+    executor: NodeExecutor,
+    *,
+    engine: str,
+    db_name: str,
+    db_user: str | None = None,
+    db_host: str = "localhost",
+) -> ExecutionResult:
+    """Drop a database and, when known, its owning account."""
+    db_name = validate_db_identifier(db_name)
+    if engine == "mariadb":
+        sql = f"DROP DATABASE IF EXISTS `{db_name}`;"
+        if db_user:
+            sql += f" DROP USER IF EXISTS '{validate_db_identifier(db_user)}'@'{validate_db_host(db_host)}';"
+        return await executor.run_command(["/usr/bin/mariadb", "-e", sql])
+
+    res = await executor.run_command(
+        ["/usr/bin/psql", "-U", "postgres", "-c", f"DROP DATABASE IF EXISTS {db_name};"]
+    )
+    if res.ok and db_user:
+        # Best-effort: the role may still own objects in other databases.
+        await executor.run_command(
+            [
+                "/usr/bin/psql",
+                "-U",
+                "postgres",
+                "-c",
+                f"DROP USER IF EXISTS {validate_db_identifier(db_user)};",
+            ]
+        )
+    return res
 
 
 async def import_sql(

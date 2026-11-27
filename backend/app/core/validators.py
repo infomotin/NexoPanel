@@ -13,6 +13,9 @@ DOMAIN_RE = re.compile(
 )
 LINUX_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
+# Grant host: an address, hostname, wildcard ("%", "192.168.0.%") or "localhost".
+DB_HOST_RE = re.compile(r"^[0-9A-Za-z_%][0-9A-Za-z_.:%-]{0,63}$")
+MYSQL_CHARSET_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,127}$")
 SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,64}$")
 QUEUE_ID_RE = re.compile(r"^[A-F0-9]{6,20}$")
@@ -45,6 +48,27 @@ def validate_db_identifier(value: str) -> str:
     if not DB_IDENTIFIER_RE.match(value):
         raise ValueError(f"Invalid SQL identifier: {value!r}")
     return value
+
+
+def validate_db_host(value: str) -> str:
+    """Validate a MySQL/MariaDB account host (``localhost``, ``%``, IP, hostname).
+
+    The value is interpolated into a ``'user'@'host'`` grant, so it is limited to
+    the characters actually meaningful there; quotes, backslashes and statement
+    terminators are rejected outright.
+    """
+    host = value.strip()
+    if not DB_HOST_RE.match(host):
+        raise ValueError(f"Invalid database host: {value!r}")
+    return host
+
+
+def validate_mysql_charset(value: str) -> str:
+    """Validate a ``CHARACTER SET`` name before it is placed in DDL."""
+    charset = value.strip()
+    if not MYSQL_CHARSET_RE.match(charset):
+        raise ValueError(f"Invalid character set: {value!r}")
+    return charset
 
 
 def validate_package_name(value: str) -> str:

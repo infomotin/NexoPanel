@@ -7,14 +7,22 @@ path-traversal / link-escape).
 """
 from __future__ import annotations
 
+import logging
 import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.config import settings
+from app.db.models import BackupManifest, ManagedDatabase
+from app.db.session import AsyncSessionLocal
 from app.drivers.storage import LocalDiskStorageBackend
 from app.services.databases import dump_database, import_sql
 from app.services.executor import get_node_executor
+
+logger = logging.getLogger(__name__)
 
 
 class UnsafeBackupArchive(ValueError):
@@ -100,6 +108,60 @@ def _read_sql_member(archive: Path) -> str:
         if extracted is None:
             raise ValueError("Unable to read the .sql dump from the backup archive")
         return extracted.read().decode("utf-8", errors="replace")
+
+
+async def _backup_engine_databases(db: AsyncSession, engine: str) -> int:
+    records = (
+        await db.execute(select(ManagedDatabase).where(ManagedDatabase.engine == engine))
+    ).scalars().all()
+    created = 0
+    for record in records:
+        try:
+            staging_path = await create_backup_archive(
+                "database", record.db_name, engine=engine
+            )
+            stored_uri, size_bytes, checksum = await store_backup_archive(staging_path)
+        except Exception as exc:  # one failing database must not abort the batch
+            logger.exception("Automatic backup failed for database %s", record.db_name)
+            db.add(
+                BackupManifest(
+                    target_type="database",
+                    target_identifier=record.db_name,
+                    storage_backend="local",
+                    artifact_path="",
+                    size_bytes=0,
+                    checksum_sha256="",
+                    status=f"failed: {exc}"[:32],
+                )
+            )
+            continue
+        db.add(
+            BackupManifest(
+                target_type="database",
+                target_identifier=record.db_name,
+                storage_backend="local",
+                artifact_path=stored_uri,
+                size_bytes=size_bytes,
+                checksum_sha256=checksum,
+                status="completed",
+            )
+        )
+        created += 1
+    return created
+
+
+async def backup_all_databases(engine: str, *, db: AsyncSession | None = None) -> int:
+    """Back up every managed database for *engine* and record a manifest each.
+
+    When *db* is given the caller owns the transaction; otherwise a session is
+    opened from the application factory (used by the scheduler).
+    """
+    if db is not None:
+        return await _backup_engine_databases(db, engine)
+    async with AsyncSessionLocal() as session:
+        created = await _backup_engine_databases(session, engine)
+        await session.commit()
+        return created
 
 
 async def restore_backup_archive(
