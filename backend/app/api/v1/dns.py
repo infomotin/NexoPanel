@@ -353,7 +353,7 @@ async def get_dns_logs(
             "target": l.target_resource,
             "status": l.status,
             "detail": l.after_state or {},
-            "created_at": l.created_at.isoformat(),
+            "created_at": l.timestamp.isoformat(),
         }
         for l in logs
     ]

@@ -541,7 +541,7 @@ async def get_file_logs(
             "action": l.action,
             "target": l.target_resource,
             "status": l.status,
-            "created_at": l.created_at.isoformat(),
+            "created_at": l.timestamp.isoformat(),
         }
         for l in logs
     ]

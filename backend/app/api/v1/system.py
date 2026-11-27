@@ -487,9 +487,12 @@ async def install_curated_package(
     )
     await db.commit()
 
+    pkg_name = target["name"]
+    cmd_str = " ".join(cmd)
+
     async def event_stream():
-        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Installer: Installing {target[\"name\"]} ==='})}\n\n"
-        yield f"data: {json.dumps({'line': f'Running command: {\" \".join(cmd)}'})}\n\n"
+        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Installer: Installing {pkg_name} ==='})}\n\n"
+        yield f"data: {json.dumps({'line': f'Running command: {cmd_str}'})}\n\n"
         res = await executor.run_command(cmd, timeout=600)
         for line in (res.stdout + "\n" + res.stderr).splitlines():
             if line.strip():
@@ -512,7 +515,7 @@ async def install_curated_package(
                 except Exception as ex:
                     yield f"data: {json.dumps({'line': f'! Post-install service step: {ex}'})}\n\n"
 
-            yield f"data: {json.dumps({'line': f'🎉 Installation of {target[\"name\"]} complete and integrated with NexoPanel!'})}\n\n"
+            yield f"data: {json.dumps({'line': f'🎉 Installation of {pkg_name} complete and integrated with NexoPanel!'})}\n\n"
         else:
             yield f"data: {json.dumps({'line': f'✗ Installation failed with exit code {res.returncode}'})}\n\n"
 
@@ -547,8 +550,11 @@ async def uninstall_curated_package(
     )
     await db.commit()
 
+    pkg_name = target["name"]
+    cmd_str = " ".join(cmd)
+
     async def event_stream():
-        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Manager: Removing {target[\"name\"]} ==='})}\n\n"
+        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Manager: Removing {pkg_name} ==='})}\n\n"
         svc = target.get("service")
         if svc:
             yield f"data: {json.dumps({'line': f'Stopping service: {svc}...'})}\n\n"
@@ -558,14 +564,14 @@ async def uninstall_curated_package(
             except Exception:
                 pass
 
-        yield f"data: {json.dumps({'line': f'Running command: {\" \".join(cmd)}'})}\n\n"
+        yield f"data: {json.dumps({'line': f'Running command: {cmd_str}'})}\n\n"
         res = await executor.run_command(cmd, timeout=300)
         for line in (res.stdout + "\n" + res.stderr).splitlines():
             if line.strip():
                 yield f"data: {json.dumps({'line': line})}\n\n"
 
         if res.ok:
-            yield f"data: {json.dumps({'line': f'✓ {target[\"name\"]} was cleanly uninstalled.'})}\n\n"
+            yield f"data: {json.dumps({'line': f'✓ {pkg_name} was cleanly uninstalled.'})}\n\n"
         else:
             yield f"data: {json.dumps({'line': f'✗ Removal exited with code {res.returncode}'})}\n\n"
 
