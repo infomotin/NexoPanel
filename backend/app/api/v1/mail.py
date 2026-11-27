@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import dns.resolver
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +18,7 @@ from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.security import hash_dovecot_sha512_crypt, secret_manager
 from app.core.validators import QUEUE_ID_RE, validate_domain
-from app.db.models import MailAlias, Mailbox, MailDomain, User
+from app.db.models import DnsRecord, DnsZone, MailAlias, Mailbox, MailDomain, User
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.drivers.mail import OutboundMailRouter, OutboundRouteConfig, generate_dkim_keypair
@@ -56,6 +56,22 @@ class AliasCreate(BaseModel):
     mail_domain_id: int
     source_email: EmailStr
     destination_email: EmailStr
+
+
+class MailServerConfigUpdate(BaseModel):
+    max_message_size_mb: int | None = Field(default=None, ge=5, le=200)
+    webmail_url: str | None = Field(default=None, max_length=255)
+    tls_security_level: str | None = Field(default=None, pattern=r"^(may|encrypt|mandatory)$")
+
+
+class TestEmailRequest(BaseModel):
+    sender: EmailStr
+    recipient: EmailStr
+    subject: str = Field(default="NexoPanel Mail Delivery Test", max_length=200)
+    body: str = Field(
+        default="This is a test email sent from NexoPanel to verify SMTP configuration and delivery.",
+        max_length=5000,
+    )
 
 
 class OutboundRouteUpdate(BaseModel):
@@ -116,6 +132,17 @@ def _mail_hostname() -> str:
 
 def _maildir_base(domain: str, local_part: str) -> Path:
     return settings.MAIL_DIR_BASE / domain / local_part
+
+
+def _get_mailbox_usage_mb(domain: str, local_part: str) -> float:
+    try:
+        path = _maildir_base(domain, local_part)
+        if not path.exists():
+            return 0.0
+        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return round(total / (1024 * 1024), 2)
+    except Exception:
+        return 0.0
 
 
 async def _ensure_maildir(domain: str, local_part: str) -> None:
@@ -483,10 +510,23 @@ async def list_mailboxes(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
     mboxes = (await db.execute(select(Mailbox).order_by(Mailbox.email))).scalars().all()
-    return [
-        {"id": m.id, "mail_domain_id": m.mail_domain_id, "email": m.email, "quota_mb": m.quota_mb, "is_active": m.is_active}
-        for m in mboxes
-    ]
+    res = []
+    for m in mboxes:
+        parts = m.email.split("@")
+        domain = parts[1] if len(parts) > 1 else ""
+        local_part = parts[0]
+        res.append(
+            {
+                "id": m.id,
+                "mail_domain_id": m.mail_domain_id,
+                "email": m.email,
+                "quota_mb": m.quota_mb,
+                "used_mb": _get_mailbox_usage_mb(domain, local_part),
+                "is_active": m.is_active,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+        )
+    return res
 
 
 @router.post("/mailboxes", status_code=status.HTTP_201_CREATED)
@@ -662,11 +702,28 @@ async def manage_postfix_queue(
     executor = get_node_executor()
     if action == "flush":
         res = await executor.run_command(["/usr/sbin/postqueue", "-f"])
-    elif action in {"hold", "delete"}:
+    elif action == "requeue":
+        if queue_id == "ALL":
+            res = await executor.run_command(["/usr/sbin/postsuper", "-r", "ALL"])
+        elif queue_id and QUEUE_ID_RE.match(queue_id):
+            res = await executor.run_command(["/usr/sbin/postsuper", "-r", queue_id])
+        else:
+            raise HTTPException(status_code=400, detail="Valid Postfix queue_id or 'ALL' required")
+    elif action == "release":
         if not queue_id or not QUEUE_ID_RE.match(queue_id):
             raise HTTPException(status_code=400, detail="Valid Postfix queue_id required")
-        flag = "-h" if action == "hold" else "-d"
-        res = await executor.run_command(["/usr/sbin/postsuper", flag, queue_id])
+        res = await executor.run_command(["/usr/sbin/postsuper", "-H", queue_id])
+    elif action == "hold":
+        if not queue_id or not QUEUE_ID_RE.match(queue_id):
+            raise HTTPException(status_code=400, detail="Valid Postfix queue_id required")
+        res = await executor.run_command(["/usr/sbin/postsuper", "-h", queue_id])
+    elif action == "delete":
+        if queue_id == "ALL_DEFERRED":
+            res = await executor.run_command(["/usr/sbin/postsuper", "-d", "ALL", "deferred"])
+        elif queue_id and QUEUE_ID_RE.match(queue_id):
+            res = await executor.run_command(["/usr/sbin/postsuper", "-d", queue_id])
+        else:
+            raise HTTPException(status_code=400, detail="Valid Postfix queue_id or 'ALL_DEFERRED' required")
     else:
         raise HTTPException(status_code=400, detail="Unsupported queue action")
 
@@ -730,3 +787,356 @@ async def update_catchall(
     )
     await db.commit()
     return {"updated": True, "catchall_address": md.catchall_address}
+
+
+@router.post("/domains/{domain_id}/sync-dns")
+async def sync_mail_domain_dns(
+    domain_id: int,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    md = (await db.execute(select(MailDomain).where(MailDomain.id == domain_id))).scalar_one_or_none()
+    if not md:
+        raise HTTPException(status_code=404, detail="Mail domain not found")
+
+    zone = (await db.execute(select(DnsZone).where(DnsZone.domain == md.domain))).scalar_one_or_none()
+    if not zone:
+        return {
+            "synced": False,
+            "message": f"No DNS zone found for '{md.domain}' in NexoPanel. Please create the DNS zone first in DNS Manager.",
+        }
+
+    public_ip = _detect_server_ip()
+    mail_host = _mail_hostname() or f"mail.{md.domain}"
+    spf_value = f"v=spf1 a mx ip4:{public_ip} ~all" if public_ip and public_ip != "127.0.0.1" else "v=spf1 a mx ~all"
+    dkim_name = f"{md.dkim_selector}._domainkey"
+    dmarc_value = f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{md.domain}"
+
+    targets = [
+        {"name": "@", "record_type": "MX", "value": f"{mail_host}.", "priority": 10, "ttl": 300},
+        {"name": mail_host.split(".")[0] if mail_host.endswith(f".{md.domain}") else "mail", "record_type": "A", "value": public_ip, "priority": None, "ttl": 300},
+        {"name": "@", "record_type": "TXT", "value": spf_value, "priority": None, "ttl": 300},
+        {"name": dkim_name, "record_type": "TXT", "value": md.dkim_public_key, "priority": None, "ttl": 300},
+        {"name": "_dmarc", "record_type": "TXT", "value": dmarc_value, "priority": None, "ttl": 300},
+    ]
+
+    existing_records = (await db.execute(select(DnsRecord).where(DnsRecord.zone_id == zone.id))).scalars().all()
+    created_count = 0
+    updated_count = 0
+
+    for t in targets:
+        match = next((r for r in existing_records if r.name == t["name"] and r.record_type == t["record_type"]), None)
+        if match:
+            if match.value != t["value"] or match.priority != t["priority"]:
+                match.value = t["value"]
+                match.priority = t["priority"]
+                updated_count += 1
+        else:
+            rec = DnsRecord(
+                zone_id=zone.id,
+                name=t["name"],
+                record_type=t["record_type"],
+                value=t["value"],
+                priority=t["priority"],
+                ttl=t["ttl"],
+            )
+            db.add(rec)
+            created_count += 1
+
+    await db.flush()
+    all_recs = (await db.execute(select(DnsRecord).where(DnsRecord.zone_id == zone.id))).scalars().all()
+
+    try:
+        from app.api.v1.dns import _sync_bind_zone
+        await _sync_bind_zone(zone, list(all_recs))
+    except Exception:
+        pass
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="mail:write",
+        action="sync_mail_domain_dns",
+        target_resource=f"mail:{md.domain}->zone:{zone.domain}",
+    )
+    await db.commit()
+    return {
+        "synced": True,
+        "zone": zone.domain,
+        "created_records": created_count,
+        "updated_records": updated_count,
+        "message": f"Successfully synced DNS records into NexoPanel zone {zone.domain} ({created_count} created, {updated_count} updated).",
+    }
+
+
+@router.get("/client-config")
+async def get_client_config(
+    email: EmailStr = Query(...),
+    _: User = Depends(require_permission("mail:read")),
+) -> dict:
+    domain_part = email.split("@")[-1]
+    mail_host = _mail_hostname() or f"mail.{domain_part}"
+    pub_ip = _detect_server_ip()
+    return {
+        "email": email,
+        "username": email,
+        "mail_host": mail_host,
+        "server_ip": pub_ip,
+        "webmail_url": "/webmail",
+        "protocols": {
+            "imap": {
+                "host": mail_host,
+                "port_ssl": 993,
+                "security_ssl": "SSL/TLS",
+                "port_starttls": 143,
+                "security_starttls": "STARTTLS",
+                "auth": "Normal password",
+            },
+            "pop3": {
+                "host": mail_host,
+                "port_ssl": 995,
+                "security_ssl": "SSL/TLS",
+                "port_starttls": 110,
+                "security_starttls": "STARTTLS",
+                "auth": "Normal password",
+            },
+            "smtp": {
+                "host": mail_host,
+                "port_tls": 587,
+                "security_tls": "STARTTLS",
+                "port_ssl": 465,
+                "security_ssl": "SSL/TLS",
+                "auth": "Normal password (authentication required)",
+            },
+        },
+    }
+
+
+@router.get("/client-config/mobileconfig")
+async def get_apple_mobileconfig(
+    email: EmailStr = Query(...),
+    _: User = Depends(require_permission("mail:read")),
+) -> Response:
+    import uuid
+
+    domain_part = email.split("@")[-1]
+    local_part = email.split("@")[0]
+    mail_host = _mail_hostname() or f"mail.{domain_part}"
+
+    payload_uuid = str(uuid.uuid4()).upper()
+    mail_uuid = str(uuid.uuid4()).upper()
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadDisplayName</key>
+    <string>{email} Mail Account</string>
+    <key>PayloadIdentifier</key>
+    <string>com.nexopanel.mail.{domain_part}.{local_part}</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>{payload_uuid}</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.mail.managed</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.nexopanel.mail.{domain_part}.{local_part}.account</string>
+            <key>PayloadUUID</key>
+            <string>{mail_uuid}</string>
+            <key>PayloadDisplayName</key>
+            <string>{email}</string>
+            <key>EmailAccountDescription</key>
+            <string>{email}</string>
+            <key>EmailAccountType</key>
+            <string>EmailTypeIMAP</string>
+            <key>EmailAddress</key>
+            <string>{email}</string>
+            <key>IncomingMailServerAuthentication</key>
+            <string>EmailAuthPassword</string>
+            <key>IncomingMailServerHostName</key>
+            <string>{mail_host}</string>
+            <key>IncomingMailServerPortNumber</key>
+            <integer>993</integer>
+            <key>IncomingMailServerUseSSL</key>
+            <true/>
+            <key>IncomingMailServerUsername</key>
+            <string>{email}</string>
+            <key>OutgoingMailServerAuthentication</key>
+            <string>EmailAuthPassword</string>
+            <key>OutgoingMailServerHostName</key>
+            <string>{mail_host}</string>
+            <key>OutgoingMailServerPortNumber</key>
+            <integer>587</integer>
+            <key>OutgoingMailServerUseSSL</key>
+            <true/>
+            <key>OutgoingMailServerUsername</key>
+            <string>{email}</string>
+            <key>OutgoingPasswordSameAsIncomingPassword</key>
+            <true/>
+        </dict>
+    </array>
+</dict>
+</plist>"""
+    return Response(
+        content=xml,
+        media_type="application/x-apple-aspen-config",
+        headers={"Content-Disposition": f'attachment; filename="{email}.mobileconfig"'},
+    )
+
+
+@router.post("/services/{service}/{action}")
+async def control_mail_service(
+    service: str,
+    action: str,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if service not in {"postfix", "dovecot", "opendkim", "rspamd"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported service: {service}")
+    if action not in {"restart", "reload", "start", "stop"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+    distro = get_distro_driver()
+    executor = get_node_executor()
+    cmd = distro.build_service_control_cmd(service, action)
+    res = await executor.run_command(cmd)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="mail:write",
+        action=f"mail_service_{action}",
+        target_resource=service,
+        after_state={"ok": res.ok, "stdout": res.stdout, "stderr": res.stderr},
+    )
+    await db.commit()
+    return {"ok": res.ok, "service": service, "action": action, "output": (res.stdout or res.stderr).strip()}
+
+
+@router.get("/config")
+async def get_mail_server_config(
+    _: User = Depends(require_permission("mail:read")),
+) -> dict:
+    executor = get_node_executor()
+    max_mb = 25
+    tls_level = "may"
+    try:
+        res = await executor.run_command(["/usr/sbin/postconf", "-h", "message_size_limit"])
+        if res.ok and res.stdout.strip().isdigit():
+            max_mb = max(5, int(res.stdout.strip()) // (1024 * 1024))
+    except Exception:
+        pass
+
+    try:
+        res_tls = await executor.run_command(["/usr/sbin/postconf", "-h", "smtpd_tls_security_level"])
+        if res_tls.ok and res_tls.stdout.strip():
+            tls_level = res_tls.stdout.strip()
+    except Exception:
+        pass
+
+    return {
+        "hostname": socket.getfqdn(),
+        "public_ip": _detect_server_ip(),
+        "mail_dir_base": str(settings.MAIL_DIR_BASE),
+        "max_message_size_mb": max_mb,
+        "tls_security_level": tls_level,
+        "webmail_url": "/webmail",
+    }
+
+
+@router.put("/config")
+async def update_mail_server_config(
+    body: MailServerConfigUpdate,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    executor = get_node_executor()
+    changes = []
+    if body.max_message_size_mb is not None:
+        bytes_val = body.max_message_size_mb * 1024 * 1024
+        await executor.run_command(["/usr/sbin/postconf", "-e", f"message_size_limit={bytes_val}"])
+        changes.append(f"message_size_limit={bytes_val}")
+
+    if body.tls_security_level is not None:
+        await executor.run_command(["/usr/sbin/postconf", "-e", f"smtpd_tls_security_level={body.tls_security_level}"])
+        changes.append(f"smtpd_tls_security_level={body.tls_security_level}")
+
+    if changes:
+        distro = get_distro_driver()
+        await executor.run_command(distro.build_service_control_cmd("postfix", "reload"))
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="mail:write",
+        action="update_mail_server_config",
+        target_resource="mail_config",
+        after_state={"changes": changes, "webmail_url": body.webmail_url},
+    )
+    await db.commit()
+    return {"updated": True, "applied": changes, "webmail_url": body.webmail_url or "/webmail"}
+
+
+@router.post("/test-email")
+async def send_test_email(
+    body: TestEmailRequest,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    executor = get_node_executor()
+    import email.utils
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = body.sender
+    msg["To"] = body.recipient
+    msg["Subject"] = body.subject
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=body.sender.split("@")[-1])
+    msg["X-Mailer"] = "NexoPanel Mail Console"
+    msg.set_content(body.body)
+
+    raw_text = msg.as_string()
+    cmd = ["/usr/sbin/sendmail", "-t", "-i", "-f", body.sender]
+    res = await executor.run_command(cmd, stdin=raw_text)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="mail:write",
+        action="send_test_email",
+        target_resource=f"{body.sender}->{body.recipient}",
+    )
+    await db.commit()
+
+    if not res.ok:
+        return {
+            "success": False,
+            "error": res.stderr or res.stdout or "Failed to deliver message to local MTA",
+            "sender": body.sender,
+            "recipient": body.recipient,
+        }
+    return {
+        "success": True,
+        "message": f"Test email handed over to Postfix MTA for {body.recipient}.",
+        "sender": body.sender,
+        "recipient": body.recipient,
+    }

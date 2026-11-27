@@ -141,6 +141,47 @@ async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict
     assert len(readiness.json()["required_records"]) == 5
     assert readiness.json()["live_checks_enabled"] is False
 
+    # Server config & services
+    cfg = await client.get("/api/v1/mail/config", headers=admin_headers)
+    assert cfg.status_code == 200
+    assert cfg.json()["max_message_size_mb"] >= 5
+
+    cfg_up = await client.put(
+        "/api/v1/mail/config",
+        headers=admin_headers,
+        json={"max_message_size_mb": 50, "tls_security_level": "may"},
+    )
+    assert cfg_up.status_code == 200
+
+    svc = await client.post("/api/v1/mail/services/postfix/restart", headers=admin_headers)
+    assert svc.status_code == 200
+    assert svc.json()["ok"] is True
+
+    # Client config & mobileconfig
+    c_conf = await client.get("/api/v1/mail/client-config?email=hello@mail.example.com", headers=admin_headers)
+    assert c_conf.status_code == 200
+    assert c_conf.json()["protocols"]["imap"]["port_ssl"] == 993
+
+    m_conf = await client.get("/api/v1/mail/client-config/mobileconfig?email=hello@mail.example.com", headers=admin_headers)
+    assert m_conf.status_code == 200
+    assert "com.apple.mail.managed" in m_conf.text
+
+    # Test email
+    test_mail = await client.post(
+        "/api/v1/mail/test-email",
+        headers=admin_headers,
+        json={"sender": "hello@mail.example.com", "recipient": "recipient@example.org", "subject": "Test", "body": "Body"},
+    )
+    assert test_mail.status_code == 200
+
+    # Sync DNS
+    sync_res = await client.post(f"/api/v1/mail/domains/{md_id}/sync-dns", headers=admin_headers)
+    assert sync_res.status_code == 200
+
+    # Queue management
+    q_req = await client.post("/api/v1/mail/queue/requeue?queue_id=ALL", headers=admin_headers)
+    assert q_req.status_code == 200
+
     assert (await client.delete(f"/api/v1/mail/domains/{md_id}", headers=admin_headers)).status_code == 200
 
     # SSL HTTP-01 (mock executor)
