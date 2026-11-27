@@ -65,7 +65,7 @@ async def test_websites_subdomains_and_apps(client: AsyncClient, admin_headers: 
 
 
 async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict[str, str]):
-    # DNS
+    # DNS (Zones, Records Edit, Providers, Pull & Logs)
     zone = await client.post("/api/v1/dns/zones", headers=admin_headers, json={"domain": "zone.example.com"})
     assert zone.status_code == 201
     zone_id = zone.json()["id"]
@@ -75,6 +75,29 @@ async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict
         json={"name": "www", "record_type": "A", "value": "192.0.2.10", "ttl": 300},
     )
     assert rec.status_code == 201
+    rec_id = rec.json()["id"]
+    upd = await client.put(
+        f"/api/v1/dns/records/{rec_id}",
+        headers=admin_headers,
+        json={"value": "192.0.2.20", "ttl": 600},
+    )
+    assert upd.status_code == 200
+    assert upd.json()["value"] == "192.0.2.20"
+
+    zones_list = (await client.get("/api/v1/dns/zones", headers=admin_headers)).json()
+    assert any(z["domain"] == "zone.example.com" and z["record_count"] >= 2 for z in zones_list)
+
+    prov = await client.post(
+        "/api/v1/dns/providers",
+        headers=admin_headers,
+        json={"name": "CF Prod", "provider_type": "cloudflare", "api_token": "cf-secret-token-123"},
+    )
+    assert prov.status_code == 201
+    prov_id = prov.json()["id"]
+    assert len((await client.get("/api/v1/dns/providers", headers=admin_headers)).json()) >= 2
+    assert (await client.post("/api/v1/dns/zones/pull", headers=admin_headers)).status_code == 200
+    assert len((await client.get("/api/v1/dns/logs", headers=admin_headers)).json()) >= 1
+    assert (await client.delete(f"/api/v1/dns/providers/{prov_id}", headers=admin_headers)).status_code == 200
 
     # Mail
     md = await client.post("/api/v1/mail/domains", headers=admin_headers, json={"domain": "mail.example.com"})
