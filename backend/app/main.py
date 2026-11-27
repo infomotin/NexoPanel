@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.core.os_gate import enforce_os_gate_or_exit
 from app.db.bootstrap import init_db_schema, seed_defaults
 from app.db.session import AsyncSessionLocal
+from app.services.scheduler import shutdown_scheduler, start_scheduler
 
 
 @asynccontextmanager
@@ -23,7 +24,11 @@ async def lifespan(_app: FastAPI):
     await init_db_schema()
     async with AsyncSessionLocal() as db:
         await seed_defaults(db)
-    yield
+    await start_scheduler()
+    try:
+        yield
+    finally:
+        await shutdown_scheduler()
 
 
 # The interactive API documentation exposes the complete endpoint inventory to

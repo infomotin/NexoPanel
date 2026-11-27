@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
@@ -12,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
 from app.core.rbac import require_permission
-from app.core.validators import validate_outbound_url
 from app.db.models import CronJob, User
 from app.db.session import get_db
-from app.services.executor import get_node_executor
+from app.services.cron import execute_cron_job
+from app.services.scheduler import schedule_job, unschedule_job
 
 router = APIRouter(prefix="/cron", tags=["Cron & Scheduled Tasks"])
 
@@ -79,6 +77,7 @@ async def create_cron_job(
         db, actor=actor, request=request, permission="cron:write", action="create_cron_job", target_resource=f"cron:{job.name}"
     )
     await db.commit()
+    schedule_job(job)
     return {"id": job.id, "name": job.name, "schedule": job.schedule}
 
 
@@ -95,30 +94,11 @@ async def run_cron_job_now(
 
     output = ""
     status_str = "success"
-    if job.job_type == "url":
-        try:
-            # SSRF guard: a scheduled URL job must not be usable to reach
-            # loopback, link-local (cloud metadata) or private addresses.
-            target_url = validate_outbound_url(job.command_or_target)
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                r = await client.get(target_url)
-                output = f"HTTP {r.status_code}: {r.text[:500]}"
-                if not r.is_success:
-                    status_str = "failed"
-        except Exception as exc:
-            output = str(exc)
-            status_str = "failed"
-    elif job.job_type == "log_rotate":
-        executor = get_node_executor()
-        res = await executor.run_command(["/usr/sbin/nginx", "-s", "reopen"])
-        output = res.stdout or res.stderr or "Rotated nginx logs"
-        status_str = "success" if res.ok else "failed"
-    else:
-        output = f"Executed {job.job_type} target '{job.command_or_target}' via NexoPanel scheduler"
+    try:
+        status_str, output = await execute_cron_job(db, job)
+    except Exception as exc:
+        status_str, output = "failed", str(exc)
 
-    job.last_run_at = datetime.now(timezone.utc)
-    job.last_status = status_str
-    job.last_output = output
     await record_audit_event(
         db, actor=actor, request=request, permission="cron:write", action="run_cron_job", target_resource=f"cron:{job.name}"
     )
@@ -137,6 +117,10 @@ async def toggle_cron_job(
     if not job:
         raise HTTPException(status_code=404, detail="Cron job not found")
     job.is_enabled = not job.is_enabled
+    if job.is_enabled:
+        schedule_job(job)
+    else:
+        unschedule_job(job.id)
     await record_audit_event(
         db, actor=actor, request=request, permission="cron:write", action="toggle_cron_job", target_resource=f"cron:{job.name}"
     )
@@ -155,6 +139,7 @@ async def delete_cron_job(
     if not job:
         raise HTTPException(status_code=404, detail="Cron job not found")
     await db.delete(job)
+    unschedule_job(job.id)
     await record_audit_event(
         db, actor=actor, request=request, permission="cron:delete", action="delete_cron_job", target_resource=f"cron:{job.name}"
     )
