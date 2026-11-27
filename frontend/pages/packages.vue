@@ -486,7 +486,13 @@ async function startSseStream(title: string, url: string, body: any) {
     if (!resp.ok) {
       if (resp.status === 401) {
         auth.clearSession()
-        navigateTo('/login')
+        logLines.value.push('[ERROR] Session expired or invalid authentication token. Redirecting to login...')
+        streamError.value = true
+        isStreaming.value = false
+        setTimeout(() => {
+          window.location.href = '/login'
+        }, 1200)
+        return
       }
       const errJson = await resp.json().catch(() => ({}))
       logLines.value.push(`[ERROR] Server responded with HTTP ${resp.status}: ${errJson.detail || 'Request failed'}`)

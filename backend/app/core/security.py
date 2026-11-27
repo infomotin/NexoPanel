@@ -141,7 +141,12 @@ def create_partial_2fa_token(subject: str, user_id: int) -> str:
 
 
 def decode_token(token: str) -> dict[str, Any]:
-    return jwt.decode(token, _get_jwt_signing_key(), algorithms=[settings.JWT_ALGORITHM])
+    return jwt.decode(
+        token,
+        _get_jwt_signing_key(),
+        algorithms=[settings.JWT_ALGORITHM],
+        leeway=60,
+    )
 
 
 # --- TOTP 2FA (RFC 6238) ---

@@ -106,8 +106,9 @@ async def login(
         permissions=user.role.permissions,
     )
     csrf_token = secrets.token_urlsafe(32)
-    response.set_cookie(key="access_token", value=access_token, httponly=True, samesite="strict")
-    response.set_cookie(key=settings.CSRF_COOKIE_NAME, value=csrf_token, httponly=False, samesite="strict")
+    cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    response.set_cookie(key="access_token", value=access_token, max_age=cookie_max_age, httponly=True, samesite="strict")
+    response.set_cookie(key=settings.CSRF_COOKIE_NAME, value=csrf_token, max_age=cookie_max_age, httponly=False, samesite="strict")
 
     await record_audit_event(
         db,
@@ -175,8 +176,9 @@ async def verify_2fa_login(
     user.last_login_at = datetime.now(timezone.utc)
     access_token = create_access_token(user.username, user.id, user.role.name, user.role.permissions)
     csrf_token = secrets.token_urlsafe(32)
-    response.set_cookie(key="access_token", value=access_token, httponly=True, samesite="strict")
-    response.set_cookie(key=settings.CSRF_COOKIE_NAME, value=csrf_token, httponly=False, samesite="strict")
+    cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    response.set_cookie(key="access_token", value=access_token, max_age=cookie_max_age, httponly=True, samesite="strict")
+    response.set_cookie(key=settings.CSRF_COOKIE_NAME, value=csrf_token, max_age=cookie_max_age, httponly=False, samesite="strict")
     await record_audit_event(
         db, actor=user, request=request, permission="auth:login", action="login_2fa_success", target_resource=f"user:{user.username}"
     )
@@ -198,7 +200,15 @@ async def verify_2fa_login(
 
 
 @router.get("/me")
-async def get_me(current_user: User = Depends(get_current_user)) -> dict:
+async def get_me(response: Response, current_user: User = Depends(get_current_user)) -> dict:
+    cookie_max_age = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    new_token = create_access_token(
+        subject=current_user.username,
+        user_id=current_user.id,
+        role_name=current_user.role.name,
+        permissions=current_user.role.permissions or [],
+    )
+    response.set_cookie(key="access_token", value=new_token, max_age=cookie_max_age, httponly=True, samesite="strict")
     return {
         "id": current_user.id,
         "username": current_user.username,
@@ -206,6 +216,7 @@ async def get_me(current_user: User = Depends(get_current_user)) -> dict:
         "role": current_user.role.name,
         "permissions": current_user.role.permissions,
         "totp_enabled": current_user.totp_enabled,
+        "access_token": new_token,
     }
 
 

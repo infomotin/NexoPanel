@@ -27,7 +27,8 @@ export default defineNuxtRouteMiddleware(async (to) => {
         headers: auth.token ? { Authorization: `Bearer ${auth.token}` } : {},
       })
       if (res.ok) {
-        auth.setUser((await res.json()) as PanelUser)
+        const data = (await res.json()) as (PanelUser & { access_token?: string })
+        auth.setUser(data, data.access_token)
       } else {
         auth.clearSession()
       }

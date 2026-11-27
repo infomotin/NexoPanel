@@ -18,11 +18,16 @@ export function useApi() {
    * `X-CSRF-Token` header on state-changing methods.
    */
   function authHeaders(method?: string): Record<string, string> {
-    if (auth.token) return { Authorization: `Bearer ${auth.token}` }
+    const headers: Record<string, string> = {}
+    if (auth.token && typeof auth.token === 'string' && auth.token.trim() && !['null', 'undefined', 'none'].includes(auth.token.trim().toLowerCase())) {
+      headers['Authorization'] = `Bearer ${auth.token.trim()}`
+    }
     const mutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes((method || 'GET').toUpperCase())
-    if (!mutating) return {}
-    const csrf = readCookie('nexopanel_csrf')
-    return csrf ? { 'X-CSRF-Token': csrf } : {}
+    if (mutating) {
+      const csrf = readCookie('nexopanel_csrf')
+      if (csrf) headers['X-CSRF-Token'] = csrf
+    }
+    return headers
   }
 
   async function apiFetch<T>(path: string, options: RequestInit & { method?: string; body?: any } = {}): Promise<T> {

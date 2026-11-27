@@ -109,9 +109,9 @@ chmod 750 "$NEXOPANEL_ETC"
 
 if [[ ! -f "${NEXOPANEL_ETC}/master.key" ]]; then
   python3 -c 'import secrets, base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())' > "${NEXOPANEL_ETC}/master.key"
-  chmod 0600 "${NEXOPANEL_ETC}/master.key"
-  chown nexopanel:nexopanel "${NEXOPANEL_ETC}/master.key"
 fi
+chmod 0640 "${NEXOPANEL_ETC}/master.key"
+chown root:nexopanel "${NEXOPANEL_ETC}/master.key"
 
 # 4. Acquire NexoPanel Source (Git Repo OR Local/Release Package)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
