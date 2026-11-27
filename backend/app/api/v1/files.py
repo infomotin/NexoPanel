@@ -4,19 +4,22 @@ from __future__ import annotations
 import os
 import shutil
 import tarfile
+import uuid
 import zipfile
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
 from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.validators import canonicalize_safe_path
-from app.db.models import User
+from app.db.models import FileTrashItem, User
 from app.db.session import get_db
 
 router = APIRouter(prefix="/files", tags=["Web File Manager"])
@@ -306,3 +309,116 @@ async def delete_item(
     )
     await db.commit()
     return {"deleted": True}
+
+
+class FetchUrlRequest(BaseModel):
+    url: str
+    destination_dir: str
+    filename: str | None = None
+
+
+@router.get("/search")
+async def search_files(
+    path: str = Query(default="/var/www"),
+    query: str = Query(..., min_length=1),
+    _: User = Depends(require_permission("files:read")),
+) -> dict:
+    root = _safe_path(path)
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Search root must be a directory")
+    matches = []
+    for p in root.rglob("*"):
+        if query.lower() in p.name.lower():
+            matches.append({"name": p.name, "path": str(p), "is_dir": p.is_dir()})
+            if len(matches) >= 100:
+                break
+    return {"matches": matches}
+
+
+@router.post("/fetch-url")
+async def fetch_remote_url(
+    body: FetchUrlRequest,
+    request: Request,
+    actor: User = Depends(require_permission("files:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    dest_dir = _safe_path(body.destination_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = Path(body.filename or body.url.split("/")[-1] or "downloaded.bin").name
+    target = _safe_path(str(dest_dir / name))
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        resp = await client.get(body.url)
+        if not resp.is_success:
+            raise HTTPException(status_code=502, detail=f"Remote fetch failed: HTTP {resp.status_code}")
+        target.write_bytes(resp.content)
+    await record_audit_event(
+        db, actor=actor, request=request, permission="files:write", action="fetch_url", target_resource=str(target)
+    )
+    await db.commit()
+    return {"saved": True, "path": str(target), "size": target.stat().st_size}
+
+
+@router.post("/trash/move")
+async def move_to_trash(
+    path: str = Query(...),
+    request: Request = None,
+    actor: User = Depends(require_permission("files:delete")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    src = _safe_path(path)
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    trash_dir = settings.BACKUP_DIR / ".trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    trash_target = trash_dir / f"{uuid.uuid4().hex}_{src.name}"
+    size = src.stat().st_size if src.is_file() else 0
+    is_dir = src.is_dir()
+    shutil.move(str(src), str(trash_target))
+    item = FileTrashItem(original_path=str(src), trash_path=str(trash_target), is_dir=is_dir, size_bytes=size)
+    db.add(item)
+    await db.flush()
+    await record_audit_event(
+        db, actor=actor, request=request, permission="files:delete", action="trash_file", target_resource=str(src)
+    )
+    await db.commit()
+    return {"trashed": True, "id": item.id}
+
+
+@router.get("/trash")
+async def list_trash(
+    _: User = Depends(require_permission("files:read")),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    items = (await db.execute(select(FileTrashItem).order_by(FileTrashItem.id.desc()))).scalars().all()
+    return [
+        {
+            "id": i.id,
+            "original_path": i.original_path,
+            "is_dir": i.is_dir,
+            "size_bytes": i.size_bytes,
+            "deleted_at": i.deleted_at.isoformat(),
+        }
+        for i in items
+    ]
+
+
+@router.post("/trash/{item_id}/restore")
+async def restore_from_trash(
+    item_id: int,
+    request: Request,
+    actor: User = Depends(require_permission("files:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = (await db.execute(select(FileTrashItem).where(FileTrashItem.id == item_id))).scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Trash item not found")
+    dest = _safe_path(item.original_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if Path(item.trash_path).exists():
+        shutil.move(item.trash_path, str(dest))
+    await db.delete(item)
+    await record_audit_event(
+        db, actor=actor, request=request, permission="files:write", action="restore_trash", target_resource=str(dest)
+    )
+    await db.commit()
+    return {"restored": True, "path": str(dest)}

@@ -37,6 +37,11 @@ ALLOWED_BINARIES: set[str] = {
     "/bin/chown",
     "/bin/chmod",
     "/usr/bin/tar",
+    "/usr/sbin/ufw",
+    "/usr/bin/fail2ban-client",
+    "/usr/bin/docker",
+    "/usr/bin/crontab",
+    "/bin/kill",
 }
 
 ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (

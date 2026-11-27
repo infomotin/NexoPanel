@@ -272,6 +272,34 @@ async def delete_website(
     return {"deleted": True}
 
 
+@router.get("/rewrite-presets")
+async def get_rewrite_presets(_: User = Depends(require_permission("websites:read"))) -> dict[str, str]:
+    return {
+        "wordpress": "location / {\n    try_files $uri $uri/ /index.php?$args;\n}",
+        "laravel": "location / {\n    try_files $uri $uri/ /index.php?$query_string;\n}",
+        "spa_history": "location / {\n    try_files $uri $uri/ /index.html;\n}",
+        "block_dotfiles": "location ~ /\\. {\n    deny all;\n}",
+    }
+
+
+@router.post("/{site_id}/toggle")
+async def toggle_website_status(
+    site_id: int,
+    request: Request,
+    actor: User = Depends(require_permission("websites:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    site = (await db.execute(select(Website).where(Website.id == site_id))).scalar_one_or_none()
+    if not site:
+        raise HTTPException(status_code=404, detail="Website not found")
+    site.status = "suspended" if site.status == "active" else "active"
+    await record_audit_event(
+        db, actor=actor, request=request, permission="websites:write", action="toggle_website", target_resource=f"website:{site.domain}:{site.status}"
+    )
+    await db.commit()
+    return {"id": site.id, "status": site.status}
+
+
 # --- Subdomain Management ---
 
 @router.get("/subdomains")

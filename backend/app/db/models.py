@@ -303,3 +303,44 @@ class InstalledApp(Base):
     status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class FirewallRule(Base):
+    __tablename__ = "firewall_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(String(64), default="local-node-01", nullable=False)
+    port: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "80", "443", "8000:8100"
+    protocol: Mapped[str] = mapped_column(String(16), default="tcp", nullable=False)  # tcp | udp | any
+    action: Mapped[str] = mapped_column(String(16), default="allow", nullable=False)  # allow | deny
+    source_ip: Mapped[str] = mapped_column(String(64), default="any", nullable=False)
+    comment: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CronJob(Base):
+    __tablename__ = "cron_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(String(64), default="local-node-01", nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False)  # shell | url | backup_site | backup_db | log_rotate
+    schedule: Mapped[str] = mapped_column(String(64), nullable=False)  # 5-field cron expression
+    command_or_target: Mapped[str] = mapped_column(Text, nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_output: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class FileTrashItem(Base):
+    __tablename__ = "file_trash_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    original_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    trash_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    is_dir: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+

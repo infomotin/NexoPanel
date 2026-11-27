@@ -409,3 +409,26 @@ async def read_mail_logs(
         return {"lines": []}
     content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     return {"lines": content[-lines:]}
+
+
+class CatchallUpdate(BaseModel):
+    catchall_address: str | None = None
+
+
+@router.put("/domains/{domain_id}/catchall")
+async def update_catchall(
+    domain_id: int,
+    body: CatchallUpdate,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    md = (await db.execute(select(MailDomain).where(MailDomain.id == domain_id))).scalar_one_or_none()
+    if not md:
+        raise HTTPException(status_code=404, detail="Mail domain not found")
+    md.catchall_address = body.catchall_address
+    await record_audit_event(
+        db, actor=actor, request=request, permission="mail:write", action="update_catchall", target_resource=f"mail:{md.domain}"
+    )
+    await db.commit()
+    return {"updated": True, "catchall_address": md.catchall_address}

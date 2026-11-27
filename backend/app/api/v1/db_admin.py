@@ -176,3 +176,47 @@ async def drop_database(
     )
     await db.commit()
     return {"deleted": True}
+
+
+class SqlImportRequest(BaseModel):
+    sql_content: str = Field(min_length=1)
+
+
+@router.post("/{db_id}/import")
+async def import_sql(
+    db_id: int,
+    body: SqlImportRequest,
+    request: Request,
+    actor: User = Depends(require_permission("databases:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rec = (await db.execute(select(ManagedDatabase).where(ManagedDatabase.id == db_id))).scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Database not found")
+    executor = get_node_executor()
+    if rec.engine == "mariadb":
+        res = await executor.run_command(["/usr/bin/mariadb", rec.db_name, "-e", body.sql_content])
+    else:
+        res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-d", rec.db_name, "-c", body.sql_content])
+    await record_audit_event(
+        db, actor=actor, request=request, permission="databases:write", action="import_sql", target_resource=f"{rec.engine}:{rec.db_name}"
+    )
+    await db.commit()
+    return {"ok": res.ok, "stdout": res.stdout, "stderr": res.stderr}
+
+
+@router.get("/{db_id}/export")
+async def export_sql(
+    db_id: int,
+    _: User = Depends(require_permission("databases:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rec = (await db.execute(select(ManagedDatabase).where(ManagedDatabase.id == db_id))).scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Database not found")
+    executor = get_node_executor()
+    if rec.engine == "mariadb":
+        res = await executor.run_command(["/usr/bin/mariadb-dump", rec.db_name])
+    else:
+        res = await executor.run_command(["/usr/bin/pg_dump", "-U", "postgres", rec.db_name])
+    return {"db_name": rec.db_name, "engine": rec.engine, "dump": res.stdout, "ok": res.ok}

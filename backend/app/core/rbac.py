@@ -50,6 +50,15 @@ ALL_PERMISSIONS: list[str] = [
     "backups:restore",
     "settings:read",
     "settings:write",
+    "firewall:read",
+    "firewall:write",
+    "cron:read",
+    "cron:write",
+    "cron:delete",
+    "processes:read",
+    "processes:write",
+    "docker:read",
+    "docker:write",
 ]
 
 bearer_scheme = HTTPBearer(auto_error=False)

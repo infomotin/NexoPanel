@@ -1,7 +1,7 @@
 """API v1 router aggregation."""
 from fastapi import APIRouter
 
-from app.api.v1 import apps, auth, backups, db_admin, dns, files, mail, rbac, sites, ssl, system, terminal
+from app.api.v1 import apps, auth, backups, cron, db_admin, dns, docker, files, firewall, mail, processes, rbac, sites, ssl, system, terminal
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
@@ -16,3 +16,7 @@ api_router.include_router(db_admin.router)
 api_router.include_router(terminal.router)
 api_router.include_router(backups.router)
 api_router.include_router(system.router)
+api_router.include_router(firewall.router)
+api_router.include_router(cron.router)
+api_router.include_router(processes.router)
+api_router.include_router(docker.router)

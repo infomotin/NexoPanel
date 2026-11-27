@@ -111,3 +111,41 @@ async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict
     audits = await client.get("/api/v1/system/audit-logs", headers=admin_headers)
     assert audits.status_code == 200
     assert len(audits.json()) >= 5
+
+
+async def test_firewall_cron_processes_docker_and_trash(client: AsyncClient, admin_headers: dict[str, str]):
+    # Firewall
+    fw = await client.post(
+        "/api/v1/firewall/rules",
+        headers=admin_headers,
+        json={"port": "443", "protocol": "tcp", "action": "allow", "source_ip": "any", "comment": "HTTPS"},
+    )
+    assert fw.status_code == 201
+    assert len((await client.get("/api/v1/firewall/rules", headers=admin_headers)).json()) == 1
+
+    # Cron
+    cron = await client.post(
+        "/api/v1/cron",
+        headers=admin_headers,
+        json={"name": "Rotate Logs", "job_type": "log_rotate", "schedule": "0 3 * * *", "command_or_target": "nginx"},
+    )
+    assert cron.status_code == 201
+    cron_id = cron.json()["id"]
+    run_res = await client.post(f"/api/v1/cron/{cron_id}/run", headers=admin_headers)
+    assert run_res.status_code == 200
+    assert run_res.json()["status"] == "success"
+
+    # Processes
+    procs = await client.get("/api/v1/processes?limit=10", headers=admin_headers)
+    assert procs.status_code == 200
+    assert len(procs.json()) > 0
+
+    # Docker
+    dkr = await client.get("/api/v1/docker/containers", headers=admin_headers)
+    assert dkr.status_code == 200
+
+    # Website rewrite presets
+    presets = await client.get("/api/v1/sites/rewrite-presets", headers=admin_headers)
+    assert presets.status_code == 200
+    assert "wordpress" in presets.json()
+
