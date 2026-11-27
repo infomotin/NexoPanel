@@ -73,8 +73,9 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
 ) -> User:
     token: str | None = None
-    if credentials and credentials.credentials:
-        token = credentials.credentials
+    raw_cred = (credentials.credentials or "").strip() if credentials else ""
+    if raw_cred and raw_cred.lower() not in {"null", "undefined", "none"}:
+        token = raw_cred
     elif "access_token" in request.cookies:
         token = request.cookies.get("access_token")
 

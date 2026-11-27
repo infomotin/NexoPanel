@@ -74,5 +74,5 @@ export function useApi() {
     }
   })()
 
-  return { apiFetch, apiBase: config.public.apiBase, wsBase: dynamicWsBase }
+  return { apiFetch, apiBase: config.public.apiBase, wsBase: dynamicWsBase, authHeaders, readCookie }
 }

@@ -343,6 +343,19 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     assert install_res.status_code == 200
     assert "text/event-stream" in install_res.headers.get("content-type", "")
 
+    # Curated package install streaming with cookie auth & dummy "Bearer null"
+    login_resp = await client.post("/api/v1/auth/login", json={"username": "admin", "password": "TestAdminPassword123!"})
+    assert login_resp.status_code == 200
+    access_cookie = login_resp.cookies.get("access_token")
+    csrf_token = login_resp.json().get("csrf_token") or login_resp.cookies.get("nexopanel_csrf")
+    install_cookie_res = await client.post(
+        "/api/v1/system/packages/curated/redis/install",
+        cookies={"access_token": access_cookie, "nexopanel_csrf": csrf_token},
+        headers={"Authorization": "Bearer null", "X-CSRF-Token": csrf_token},
+    )
+    assert install_cookie_res.status_code == 200
+    assert "text/event-stream" in install_cookie_res.headers.get("content-type", "")
+
     # 5. Curated package uninstall streaming
     uninstall_res = await client.post(
         "/api/v1/system/packages/curated/nginx/uninstall",

@@ -324,7 +324,7 @@ import { Plus, RefreshCw } from 'lucide-vue-next'
 import { useAuthStore } from '~/stores/auth'
 
 const auth = useAuthStore()
-const { apiFetch, apiBase } = useApi()
+const { apiFetch, apiBase, authHeaders } = useApi()
 
 const activeCategory = ref('ALL')
 const search = ref('')
@@ -475,14 +475,19 @@ async function startSseStream(title: string, url: string, body: any) {
   try {
     const resp = await fetch(url, {
       method: 'POST',
+      credentials: 'same-origin',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${auth.token}`,
+        ...authHeaders('POST'),
       },
       body: JSON.stringify(body),
     })
 
     if (!resp.ok) {
+      if (resp.status === 401) {
+        auth.clearSession()
+        navigateTo('/login')
+      }
       const errJson = await resp.json().catch(() => ({}))
       logLines.value.push(`[ERROR] Server responded with HTTP ${resp.status}: ${errJson.detail || 'Request failed'}`)
       streamError.value = true

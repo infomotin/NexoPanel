@@ -1,4 +1,3 @@
-/// <reference types="@nuxt/telemetry" />
 /// <reference types="@nuxtjs/tailwindcss" />
 /// <reference types="@pinia/nuxt" />
 /// <reference path="types/nitro-layouts.d.ts" />
