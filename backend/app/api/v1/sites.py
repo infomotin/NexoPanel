@@ -300,6 +300,55 @@ async def toggle_website_status(
     return {"id": site.id, "status": site.status}
 
 
+class BatchSiteRequest(BaseModel):
+    site_ids: list[int] = Field(min_length=1)
+    action: str = Field(pattern="^(start|stop|delete)$")
+
+
+@router.post("/batch")
+async def batch_website_action(
+    body: BatchSiteRequest,
+    request: Request,
+    actor: User = Depends(require_permission("websites:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    sites = (await db.execute(select(Website).where(Website.id.in_(body.site_ids)))).scalars().all()
+    for site in sites:
+        if body.action == "start":
+            site.status = "active"
+        elif body.action == "stop":
+            site.status = "suspended"
+        elif body.action == "delete":
+            await db.delete(site)
+    await record_audit_event(
+        db, actor=actor, request=request, permission="websites:write", action=f"batch_websites_{body.action}", target_resource=str(body.site_ids)
+    )
+    await db.commit()
+    return {"processed": len(sites), "action": body.action}
+
+
+@router.get("/{site_id}/logs")
+async def get_website_logs(
+    site_id: int,
+    log_type: str = "access",
+    lines: int = 100,
+    _: User = Depends(require_permission("websites:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    site = (await db.execute(select(Website).where(Website.id == site_id))).scalar_one_or_none()
+    if not site:
+        raise HTTPException(status_code=404, detail="Website not found")
+    candidates = [
+        Path(f"/var/log/nginx/{site.domain}.{log_type}.log"),
+        Path(f"/var/log/nginx/{log_type}.log"),
+    ]
+    for p in candidates:
+        if p.exists():
+            content = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            return {"domain": site.domain, "path": str(p), "lines": content[-lines:]}
+    return {"domain": site.domain, "path": str(candidates[0]), "lines": []}
+
+
 # --- Subdomain Management ---
 
 @router.get("/subdomains")

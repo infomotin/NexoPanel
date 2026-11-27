@@ -98,6 +98,7 @@ fi
 
 mkdir -p "$NEXOPANEL_HOME" "$NEXOPANEL_DATA" "$NEXOPANEL_ETC" "$NEXOPANEL_RUN" "$NEXOPANEL_LOG" "$NEXOPANEL_BACKUP" /var/www/acme-challenge/.well-known/acme-challenge
 chown -R nexopanel:nexopanel "$NEXOPANEL_DATA" "$NEXOPANEL_LOG" "$NEXOPANEL_BACKUP" "$NEXOPANEL_RUN"
+chown root:nexopanel "$NEXOPANEL_ETC"
 chmod 750 "$NEXOPANEL_ETC"
 
 if [[ ! -f "${NEXOPANEL_ETC}/master.key" ]]; then
