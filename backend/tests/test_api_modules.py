@@ -310,6 +310,7 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     assert len(catalog) > 10
     slugs = [p["slug"] for p in catalog]
     assert "nginx" in slugs
+    assert "php8.5" in slugs
     assert "php8.4" in slugs
     assert "mariadb" in slugs
     assert "pure-ftpd" in slugs
@@ -323,6 +324,7 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     php_runtimes_res = await client.get("/api/v1/system/runtimes/php", headers=admin_headers)
     assert php_runtimes_res.status_code == 200
     runtimes = php_runtimes_res.json()
+    assert any(r["version"] == "8.5" for r in runtimes)
     assert any(r["version"] == "8.4" for r in runtimes)
     assert any(r["version"] == "8.3" for r in runtimes)
 
@@ -355,6 +357,23 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     )
     assert install_cookie_res.status_code == 200
     assert "text/event-stream" in install_cookie_res.headers.get("content-type", "")
+
+    # Multi-token fallback: Stale Bearer token in header falls back seamlessly to valid access_token cookie
+    stale_bearer_res = await client.post(
+        "/api/v1/system/packages/curated/redis/install",
+        cookies={"access_token": access_cookie, "nexopanel_csrf": csrf_token},
+        headers={"Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.invalid.stale", "X-CSRF-Token": csrf_token},
+    )
+    assert stale_bearer_res.status_code == 200
+    assert "text/event-stream" in stale_bearer_res.headers.get("content-type", "")
+
+    # Multi-token fallback: URL query parameter ?token= fallback
+    query_param_res = await client.post(
+        f"/api/v1/system/packages/curated/redis/install?token={access_cookie}",
+        headers={"Authorization": "Bearer expired_junk"},
+    )
+    assert query_param_res.status_code == 200
+    assert "text/event-stream" in query_param_res.headers.get("content-type", "")
 
     # 5. Curated package uninstall streaming
     uninstall_res = await client.post(

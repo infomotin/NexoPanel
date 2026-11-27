@@ -465,6 +465,51 @@ async function controlService(slug: string, action: string) {
   }
 }
 
+async function consumeStream(resp: Response) {
+  const reader = resp.body?.getReader()
+  if (!reader) {
+    logLines.value.push('[ERROR] Response body stream unavailable.')
+    isStreaming.value = false
+    return
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const chunks = buffer.split('\n\n')
+    buffer = chunks.pop() || ''
+
+    for (const chunk of chunks) {
+      if (chunk.startsWith('data: ')) {
+        try {
+          const parsed = JSON.parse(chunk.slice(6))
+          if (parsed.line) {
+            logLines.value.push(parsed.line)
+          }
+          if (parsed.done) {
+            if (parsed.returncode !== 0) {
+              streamError.value = true
+            }
+          }
+        } catch {
+          // Ignore parse errors on partial chunks
+        }
+      }
+    }
+
+    // Auto scroll
+    nextTick(() => {
+      if (logContainer.value) {
+        logContainer.value.scrollTop = logContainer.value.scrollHeight
+      }
+    })
+  }
+}
+
 async function startSseStream(title: string, url: string, body: any) {
   streamTitle.value = title
   logLines.value = [`[NexoPanel] Initializing operation: ${title}...`]
@@ -473,7 +518,13 @@ async function startSseStream(title: string, url: string, body: any) {
   streamError.value = false
 
   try {
-    const resp = await fetch(url, {
+    let requestUrl = url
+    if (auth.token && typeof auth.token === 'string' && auth.token.trim()) {
+      const sep = requestUrl.includes('?') ? '&' : '?'
+      requestUrl = `${requestUrl}${sep}token=${encodeURIComponent(auth.token.trim())}`
+    }
+
+    const resp = await fetch(requestUrl, {
       method: 'POST',
       credentials: 'same-origin',
       headers: {
@@ -485,6 +536,39 @@ async function startSseStream(title: string, url: string, body: any) {
 
     if (!resp.ok) {
       if (resp.status === 401) {
+        logLines.value.push('[WARN] Stale session token detected. Attempting automatic session revalidation...')
+        try {
+          const meRes = await fetch(`${apiBase}/auth/me`, {
+            method: 'GET',
+            credentials: 'same-origin',
+          })
+          if (meRes.ok) {
+            const meData = await meRes.json()
+            if (meData?.access_token) {
+              auth.setUser(meData, meData.access_token)
+              logLines.value.push('[NexoPanel] ✓ Session revalidated successfully. Resuming operation...')
+              const sep = url.includes('?') ? '&' : '?'
+              const retryUrl = `${url}${sep}token=${encodeURIComponent(meData.access_token)}`
+              const retryResp = await fetch(retryUrl, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${meData.access_token}`,
+                  ...authHeaders('POST'),
+                },
+                body: JSON.stringify(body),
+              })
+              if (retryResp.ok) {
+                await consumeStream(retryResp)
+                return
+              }
+            }
+          }
+        } catch {
+          // Session revalidation attempt failed
+        }
+
         auth.clearSession()
         logLines.value.push('[ERROR] Session expired or invalid authentication token. Redirecting to login...')
         streamError.value = true
@@ -494,6 +578,7 @@ async function startSseStream(title: string, url: string, body: any) {
         }, 1200)
         return
       }
+
       const errJson = await resp.json().catch(() => ({}))
       logLines.value.push(`[ERROR] Server responded with HTTP ${resp.status}: ${errJson.detail || 'Request failed'}`)
       streamError.value = true
@@ -501,48 +586,7 @@ async function startSseStream(title: string, url: string, body: any) {
       return
     }
 
-    const reader = resp.body?.getReader()
-    if (!reader) {
-      logLines.value.push('[ERROR] Response body stream unavailable.')
-      isStreaming.value = false
-      return
-    }
-
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const chunks = buffer.split('\n\n')
-      buffer = chunks.pop() || ''
-
-      for (const chunk of chunks) {
-        if (chunk.startsWith('data: ')) {
-          try {
-            const parsed = JSON.parse(chunk.slice(6))
-            if (parsed.line) {
-              logLines.value.push(parsed.line)
-            }
-            if (parsed.done) {
-              if (parsed.returncode !== 0) {
-                streamError.value = true
-              }
-            }
-          } catch {
-            // Ignore parse errors on partial chunks
-          }
-        }
-      }
-
-      // Auto scroll
-      nextTick(() => {
-        if (logContainer.value) {
-          logContainer.value.scrollTop = logContainer.value.scrollHeight
-        }
-      })
-    }
+    await consumeStream(resp)
   } catch (err: any) {
     logLines.value.push(`[ERROR] Network or connection error: ${err.message}`)
     streamError.value = true

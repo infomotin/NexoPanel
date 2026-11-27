@@ -72,43 +72,67 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    token: str | None = None
+    # 1. Gather all candidate token sources in priority order
+    candidates: list[str] = []
+
+    # Bearer header from bearer_scheme
     raw_cred = (credentials.credentials or "").strip() if credentials else ""
     if raw_cred and raw_cred.lower() not in {"null", "undefined", "none"}:
-        token = raw_cred
-    elif "access_token" in request.cookies:
-        token = request.cookies.get("access_token")
+        candidates.append(raw_cred)
 
-    if not token:
+    # Authorization header fallback if HTTPBearer scheme missed it
+    auth_header = (request.headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token_from_auth = auth_header[7:].strip()
+        if token_from_auth and token_from_auth not in candidates and token_from_auth.lower() not in {"null", "undefined", "none"}:
+            candidates.append(token_from_auth)
+
+    # HttpOnly or standard access_token cookie
+    cookie_token = (request.cookies.get("access_token") or "").strip()
+    if cookie_token and cookie_token not in candidates and cookie_token.lower() not in {"null", "undefined", "none"}:
+        candidates.append(cookie_token)
+
+    # Custom x-access-token header
+    x_token = (request.headers.get("x-access-token") or "").strip()
+    if x_token and x_token not in candidates and x_token.lower() not in {"null", "undefined", "none"}:
+        candidates.append(x_token)
+
+    # URL query parameter ?token= or ?access_token= (essential for SSE / EventSource streams)
+    query_token = (request.query_params.get("token") or request.query_params.get("access_token") or "").strip()
+    if query_token and query_token not in candidates and query_token.lower() not in {"null", "undefined", "none"}:
+        candidates.append(query_token)
+
+    if not candidates:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
 
-    try:
-        payload = decode_token(token)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired authentication token",
-        ) from exc
+    # 2. Test candidate tokens in sequence
+    for token in candidates:
+        try:
+            payload = decode_token(token)
+            if payload.get("type") != "access":
+                continue
 
-    if payload.get("type") != "access":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token type",
-        )
+            user_id = payload.get("uid")
+            if not user_id:
+                continue
 
-    user_id = payload.get("uid")
-    stmt = select(User).where(User.id == user_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User account inactive or not found",
-        )
-    return user
+            stmt = select(User).where(User.id == user_id)
+            result = await db.execute(stmt)
+            user = result.scalar_one_or_none()
+            if not user or not user.is_active:
+                continue
+
+            return user
+        except Exception:
+            continue
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired authentication token",
+    )
 
 
 def require_permission(permission: str):

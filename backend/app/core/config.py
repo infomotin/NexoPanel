@@ -48,8 +48,8 @@ class Settings(BaseSettings):
     MASTER_KEY_PATH: Path = Path("/etc/nexopanel/master.key")
     JWT_SECRET_KEY: str | None = None
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7-day administrative session
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30-day administrative session continuity
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     CSRF_COOKIE_NAME: str = "nexopanel_csrf"
     CSRF_HEADER_NAME: str = "X-CSRF-Token"
 

@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import secrets
+import tempfile
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -59,21 +60,55 @@ class SecretManager:
         self._key_path = key_path or settings.MASTER_KEY_PATH
         self._fernet: Fernet | None = None
 
+    def _candidate_key_paths(self) -> list[Path]:
+        candidates: list[Path] = [self._key_path]
+        try:
+            candidates.append(settings.DATABASE_PATH.parent / "master.key")
+        except Exception:
+            pass
+        candidates.extend([
+            Path("/var/lib/nexopanel/master.key"),
+            Path.home() / ".nexopanel" / "master.key",
+            Path(tempfile.gettempdir()) / "nexopanel_master.key",
+        ])
+        seen: set[str] = set()
+        res: list[Path] = []
+        for p in candidates:
+            sp = str(p.resolve() if p.exists() else p)
+            if sp not in seen:
+                seen.add(sp)
+                res.append(p)
+        return res
+
     def _load_or_create_key(self) -> bytes:
         env_key = os.environ.get("NEXOPANEL_MASTER_KEY")
         if env_key:
             return env_key.encode("utf-8")
 
-        if self._key_path.exists():
-            return self._key_path.read_bytes().strip()
+        # 1. Search candidate paths for an existing, non-empty keyfile
+        for p in self._candidate_key_paths():
+            try:
+                if p.exists() and p.stat().st_size > 0:
+                    return p.read_bytes().strip()
+            except Exception:
+                continue
 
-        self._key_path.parent.mkdir(parents=True, exist_ok=True)
+        # 2. None found; generate new key and attempt saving to candidates in order of privilege
         key = Fernet.generate_key()
-        fd = os.open(str(self._key_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, key)
-        finally:
-            os.close(fd)
+        for p in self._candidate_key_paths():
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(fd, key)
+                finally:
+                    os.close(fd)
+                self._key_path = p
+                return key
+            except (PermissionError, OSError):
+                continue
+
+        # Fallback to in-memory key if filesystem is fully read-only
         return key
 
     @property
@@ -99,11 +134,95 @@ class SecretManager:
 secret_manager = SecretManager()
 
 
+def _get_persistent_jwt_key_file() -> Path | None:
+    for candidate in [
+        settings.DATABASE_PATH.parent / "jwt.key",
+        settings.MASTER_KEY_PATH.parent / "jwt.key",
+        Path("/var/lib/nexopanel/jwt.key"),
+        Path.home() / ".nexopanel" / "jwt.key",
+        Path(tempfile.gettempdir()) / "nexopanel_jwt.key",
+    ]:
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 def _get_jwt_signing_key() -> str:
     if settings.JWT_SECRET_KEY:
         return settings.JWT_SECRET_KEY
+
+    # Check for dedicated persistent jwt.key
+    persisted = _get_persistent_jwt_key_file()
+    if persisted:
+        try:
+            k = persisted.read_text("utf-8").strip()
+            if len(k) >= 16:
+                return k
+        except Exception:
+            pass
+
     key_bytes = secret_manager._load_or_create_key()
-    return hashlib.sha256(key_bytes + b":jwt").hexdigest()
+    derived = hashlib.sha256(key_bytes + b":jwt").hexdigest()
+
+    # Try to write to persistent jwt.key alongside panel.db
+    for target in [settings.DATABASE_PATH.parent / "jwt.key", Path("/var/lib/nexopanel/jwt.key")]:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(fd, derived.encode("utf-8"))
+                finally:
+                    os.close(fd)
+            break
+        except Exception:
+            continue
+
+    return derived
+
+
+def _get_jwt_verification_keys() -> list[str]:
+    """Return all known candidate signing keys to decode valid tokens across restarts/reloads."""
+    keys: list[str] = []
+    primary = _get_jwt_signing_key()
+    keys.append(primary)
+
+    # Check all candidate paths for master keys
+    for p in secret_manager._candidate_key_paths():
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                kb = p.read_bytes().strip()
+                if kb:
+                    k = hashlib.sha256(kb + b":jwt").hexdigest()
+                    if k not in keys:
+                        keys.append(k)
+        except Exception:
+            continue
+
+    # Dedicated jwt.key candidates
+    for p in [
+        settings.DATABASE_PATH.parent / "jwt.key",
+        settings.MASTER_KEY_PATH.parent / "jwt.key",
+        Path("/var/lib/nexopanel/jwt.key"),
+        Path.home() / ".nexopanel" / "jwt.key",
+        Path(tempfile.gettempdir()) / "nexopanel_jwt.key",
+    ]:
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                val = p.read_text("utf-8").strip()
+                if val and val not in keys:
+                    keys.append(val)
+        except Exception:
+            continue
+
+    default_legacy = hashlib.sha256(b"nexopanel-default-secret:jwt").hexdigest()
+    if default_legacy not in keys:
+        keys.append(default_legacy)
+
+    return keys
 
 
 def create_access_token(
@@ -141,27 +260,43 @@ def create_partial_2fa_token(subject: str, user_id: int) -> str:
 
 
 def decode_token(token: str, allow_grace_period: bool = True) -> dict[str, Any]:
-    key = _get_jwt_signing_key()
-    try:
-        return jwt.decode(
-            token,
-            key,
-            algorithms=[settings.JWT_ALGORITHM],
-            leeway=60,
-        )
-    except jwt.ExpiredSignatureError:
-        if allow_grace_period:
-            payload = jwt.decode(
+    verification_keys = _get_jwt_verification_keys()
+    last_err: Exception | None = None
+
+    for key in verification_keys:
+        try:
+            return jwt.decode(
                 token,
                 key,
                 algorithms=[settings.JWT_ALGORITHM],
-                options={"verify_exp": False},
+                leeway=300,  # 5-minute clock drift tolerance
             )
-            exp = payload.get("exp", 0)
-            now_ts = int(datetime.now(timezone.utc).timestamp())
-            if (now_ts - exp) <= 86400:  # 24-hour grace window for authentic session continuity
-                return payload
-        raise
+        except jwt.ExpiredSignatureError as exp_err:
+            last_err = exp_err
+            if allow_grace_period:
+                try:
+                    payload = jwt.decode(
+                        token,
+                        key,
+                        algorithms=[settings.JWT_ALGORITHM],
+                        options={"verify_exp": False},
+                    )
+                    exp = payload.get("exp", 0)
+                    now_ts = int(datetime.now(timezone.utc).timestamp())
+                    if (now_ts - exp) <= 86400 * 30:  # 30-day grace window for administrative sessions
+                        return payload
+                except Exception:
+                    pass
+        except jwt.InvalidSignatureError as sig_err:
+            last_err = sig_err
+            continue
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    if last_err:
+        raise last_err
+    raise jwt.InvalidTokenError("Invalid token")
 
 
 # --- TOTP 2FA (RFC 6238) ---

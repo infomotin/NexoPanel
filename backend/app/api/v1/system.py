@@ -207,6 +207,16 @@ CURATED_STACK_CATALOG: list[dict[str, Any]] = [
         "icon": "globe",
     },
     {
+        "slug": "php8.5",
+        "name": "PHP 8.5 (FPM)",
+        "category": "PHP",
+        "description": "Next-generation PHP 8.5 preview/edge runtime with PHP-FPM and standard extensions (mysql, curl, mbstring, xml, zip, gd, opcache).",
+        "apt_packages": ["php8.5-fpm", "php8.5-cli", "php8.5-mysql", "php8.5-curl", "php8.5-mbstring", "php8.5-xml", "php8.5-zip", "php8.5-gd", "php8.5-opcache"],
+        "service": "php8.5-fpm",
+        "php_version": "8.5",
+        "icon": "file-code",
+    },
+    {
         "slug": "php8.4",
         "name": "PHP 8.4 (FPM)",
         "category": "PHP",
@@ -536,6 +546,20 @@ async def install_curated_package(
         for line in (res.stdout + "\n" + res.stderr).splitlines():
             if line.strip():
                 yield f"data: {json.dumps({'line': line})}\n\n"
+
+        # If PHP package wasn't found in stock repo, attempt automatic Ondrej Sury PPA setup
+        if not res.ok and target.get("category") == "PHP" and distro.family == "debian":
+            yield f"data: {json.dumps({'line': 'Stock repositories do not have target PHP packages. Configuring Ondřej Surý PHP repository...'})}\n\n"
+            await executor.run_command(["/usr/bin/apt-get", "install", "-y", "-q", "software-properties-common", "ca-certificates", "apt-transport-https"])
+            ppa_res = await executor.run_command(["/usr/bin/add-apt-repository", "-y", "ppa:ondrej/php"])
+            if ppa_res.ok:
+                yield f"data: {json.dumps({'line': '✓ Added ppa:ondrej/php. Updating APT repository index...'})}\n\n"
+                await executor.run_command(["/usr/bin/apt-get", "update", "-qq"])
+                yield f"data: {json.dumps({'line': f'Retrying installation of {pkg_name}...'})}\n\n"
+                res = await executor.run_command(cmd, timeout=600)
+                for line in (res.stdout + "\n" + res.stderr).splitlines():
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line})}\n\n"
 
         if res.ok:
             yield f"data: {json.dumps({'line': '✓ APT packages installed successfully.'})}\n\n"
