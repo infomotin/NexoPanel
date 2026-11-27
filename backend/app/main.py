@@ -74,8 +74,12 @@ if _FRONTEND_DIST.is_dir():
             raise HTTPException(status_code=404, detail="API endpoint not found")
         candidate = _FRONTEND_DIST / full_path
         if candidate.is_file():
-            return FileResponse(str(candidate))
+            headers = {"Cache-Control": "no-store, no-cache, must-revalidate"} if candidate.suffix == ".html" else {}
+            return FileResponse(str(candidate), headers=headers)
+        dir_index = candidate / "index.html"
+        if dir_index.is_file():
+            return FileResponse(str(dir_index), headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
         index_html = _FRONTEND_DIST / "index.html"
         if index_html.is_file():
-            return FileResponse(str(index_html))
+            return FileResponse(str(index_html), headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
         raise HTTPException(status_code=404, detail="Frontend not built")

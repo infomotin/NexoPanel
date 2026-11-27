@@ -242,8 +242,10 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now nginx mariadb postgresql postfix dovecot named fail2ban nexopanel-daemon nexopanel
+systemctl enable --now nginx mariadb postgresql postfix dovecot named fail2ban
 systemctl enable --now pure-ftpd >/dev/null 2>&1 || true
+systemctl enable nexopanel-daemon nexopanel
+systemctl restart nexopanel-daemon nexopanel
 
 # Open panel port in UFW if active
 if ufw status | grep -q "Status: active"; then
