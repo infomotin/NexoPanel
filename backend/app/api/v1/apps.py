@@ -15,6 +15,7 @@ from app.db.models import InstalledApp, ManagedDatabase, User, Website
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.drivers.webserver import NginxProvider, VhostConfig
+from app.services.databases import provision_database, record_database_password
 from app.services.executor import get_node_executor
 
 router = APIRouter(prefix="/apps", tags=["One-Click Apps"])
@@ -129,7 +130,22 @@ async def deploy_app(
         db_name = f"np_{safe_prefix}"
         db_user = f"u_{safe_prefix[:16]}"
         db_password = secrets.token_urlsafe(16)
+        provision = await provision_database(
+            executor,
+            engine=body.db_engine,
+            db_name=db_name,
+            db_user=db_user,
+            db_password=db_password,
+        )
+        if not provision.ok:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database provisioning failed: {provision.stderr or provision.stdout}",
+            )
         db.add(ManagedDatabase(engine=body.db_engine, db_name=db_name, db_user=db_user))
+        await record_database_password(
+            db, engine=body.db_engine, db_name=db_name, password=db_password, note=body.domain
+        )
         env_content = (
             f"APP_URL=https://{body.domain}\n"
             f"DB_CONNECTION={body.db_engine}\n"
