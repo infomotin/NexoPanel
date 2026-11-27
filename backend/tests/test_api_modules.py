@@ -149,3 +149,13 @@ async def test_firewall_cron_processes_docker_and_trash(client: AsyncClient, adm
     assert presets.status_code == 200
     assert "wordpress" in presets.json()
 
+    # FTP Account
+    roots = (await client.get("/api/v1/files/roots", headers=admin_headers)).json()["roots"]
+    ftp_res = await client.post(
+        "/api/v1/ftp",
+        headers=admin_headers,
+        json={"username": "ftp_user1", "password": "FtpPassword123!", "home_directory": roots[0]},
+    )
+    assert ftp_res.status_code == 201
+    assert ftp_res.json()["username"] == "ftp_user1"
+

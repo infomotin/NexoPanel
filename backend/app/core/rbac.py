@@ -59,6 +59,9 @@ ALL_PERMISSIONS: list[str] = [
     "processes:write",
     "docker:read",
     "docker:write",
+    "ftp:read",
+    "ftp:write",
+    "ftp:delete",
 ]
 
 bearer_scheme = HTTPBearer(auto_error=False)

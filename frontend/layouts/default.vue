@@ -110,6 +110,7 @@ const navItems = [
   { label: 'DNS', to: '/dns', icon: Activity, perm: 'dns:read' },
   { label: 'SSL / ACME', to: '/ssl', icon: KeyRound, perm: 'ssl:read' },
   { label: 'Files', to: '/files', icon: FileCode2, perm: 'files:read' },
+  { label: 'FTP', to: '/ftp', icon: HardDrive, perm: 'ftp:read' },
   { label: 'Terminal', to: '/terminal', icon: Terminal, perm: 'terminal:execute' },
   { label: 'Backups', to: '/backups', icon: Archive, perm: 'backups:read' },
   { label: 'App Store', to: '/apps', icon: Store, perm: 'apps:read' },
