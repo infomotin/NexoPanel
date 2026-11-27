@@ -1,6 +1,9 @@
 # NexoPanel
 
-**NexoPanel** is a clean-room, production-grade Linux web hosting control panel built from scratch with **FastAPI**, **SQLAlchemy 2.0 (async)**, **SQLite 3 (WAL)**, and **Nuxt 3 (Vue 3 + TypeScript + Tailwind CSS + xterm.js)**.
+**NexoPanel** is an open-source, clean-room, production-grade Linux web hosting control panel built from scratch with **FastAPI**, **SQLAlchemy 2.0 (async)**, **SQLite 3 (WAL)**, and **Nuxt 3 (Vue 3 + TypeScript + Tailwind CSS + xterm.js)**.
+
+* **GitHub Repository:** https://github.com/infomotin/NexoPanel
+* **License:** MIT ([LICENSE](LICENSE))
 
 ---
 
@@ -56,15 +59,15 @@ npm run dev
 
 ### Production Installation (Ubuntu 22.04 / 24.04 / 26.04 LTS or Debian 12)
 
-**Option A — Install directly from your Git repository:**
+**Option A — Install directly from GitHub (`https://github.com/infomotin/NexoPanel`):**
 ```bash
-git clone https://github.com/<your-org>/nexopanel.git
-cd nexopanel
+git clone https://github.com/infomotin/NexoPanel.git
+cd NexoPanel
 sudo bash scripts/install.sh
 ```
 Or one-line remote install:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-org>/nexopanel/main/scripts/install.sh | sudo bash -s -- --repo https://github.com/<your-org>/nexopanel.git
+curl -fsSL https://raw.githubusercontent.com/infomotin/NexoPanel/main/scripts/install.sh | sudo bash -s -- --repo https://github.com/infomotin/NexoPanel.git
 ```
 
 **Option B — Build & install a self-contained release tarball:**

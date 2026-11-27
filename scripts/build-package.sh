@@ -22,6 +22,7 @@ rsync -a --exclude '.venv' --exclude '__pycache__' --exclude '.pytest_cache' "${
 cp -r "${REPO_ROOT}/frontend/.output/public" "${STAGE_DIR}/frontend/.output/"
 cp "${REPO_ROOT}/scripts/install.sh" "${STAGE_DIR}/scripts/"
 cp "${REPO_ROOT}/README.md" "${STAGE_DIR}/"
+cp "${REPO_ROOT}/LICENSE" "${STAGE_DIR}/"
 
 tar -czf "${DIST_DIR}/nexopanel-${VERSION}-linux.tar.gz" -C "$DIST_DIR" "nexopanel-${VERSION}"
 rm -rf "$STAGE_DIR"

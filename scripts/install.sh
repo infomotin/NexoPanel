@@ -128,7 +128,10 @@ elif [[ -d "${REPO_ROOT}/backend" ]]; then
     cp -r "${REPO_ROOT}/frontend" "${NEXOPANEL_HOME}/"
   fi
 else
-  err "No backend directory found and no --repo <git-url> specified."
+  GIT_REPO="https://github.com/infomotin/NexoPanel.git"
+  log "No local backend directory found; cloning from ${GIT_REPO} (${GIT_BRANCH})..."
+  rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
+  git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
 fi
 
 # 5. Build Frontend Static Bundle if not pre-packaged
