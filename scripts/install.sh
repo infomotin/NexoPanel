@@ -161,8 +161,17 @@ if [[ -d "${NEXOPANEL_HOME}/frontend" ]] && { [[ "$REBUILD_FRONTEND" -eq 1 ]] ||
   export NUXT_PUBLIC_API_BASE="/api/v1"
   export NUXT_PUBLIC_WS_BASE="ws://${SERVER_IP}:8443/api/v1"
   rm -rf "${NEXOPANEL_HOME}/frontend/.output" "${NEXOPANEL_HOME}/frontend/.nuxt"
-  npm --prefix "${NEXOPANEL_HOME}/frontend" install --no-audit --no-fund
-  npm --prefix "${NEXOPANEL_HOME}/frontend" run generate
+  if [[ -d "${NEXOPANEL_HOME}/frontend/node_modules" && ! -x "${NEXOPANEL_HOME}/frontend/node_modules/.bin/nuxt" ]]; then
+    rm -rf "${NEXOPANEL_HOME}/frontend/node_modules"
+  fi
+  npm --prefix "${NEXOPANEL_HOME}/frontend" install --no-audit --no-fund --ignore-scripts
+  chmod -R a+rX "${NEXOPANEL_HOME}/frontend/node_modules" 2>/dev/null || true
+  find "${NEXOPANEL_HOME}/frontend/node_modules" -type f \( -path "*/.bin/*" -o -path "*/bin/*" -o -name "esbuild" \) -exec chmod +x {} + 2>/dev/null || true
+  (
+    cd "${NEXOPANEL_HOME}/frontend"
+    node ./node_modules/nuxt/bin/nuxt.mjs prepare
+    node ./node_modules/nuxt/bin/nuxt.mjs generate
+  )
 fi
 
 # 6. Python Virtual Environment & Backend Dependencies
