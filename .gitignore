@@ -1,6 +1,10 @@
 node_modules/
-.output/
+.output/*
+!.output/public/
+**/.output/*
+!**/.output/public/
 .nuxt/
+**/.nuxt/
 dist/
 *.log
 data/

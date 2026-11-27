@@ -27,7 +27,29 @@ fi
 log "Updating ${NEXOPANEL_HOME} from origin/${GIT_BRANCH}..."
 git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" fetch --all --prune
 git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
-git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
+git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" reset --hard origin/"$GIT_BRANCH" || git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" pull origin "$GIT_BRANCH"
 
-log "Re-running installer to rebuild the frontend and restart services..."
-bash "${NEXOPANEL_HOME}/scripts/install.sh"
+if [[ "${1:-}" == "--full" ]]; then
+  log "Running full installer (re-provisioning services and checking OS runtime)..."
+  bash "${NEXOPANEL_HOME}/scripts/install.sh"
+else
+  log "Applying updates to backend dependencies, directories, and restarting services..."
+  if [[ -f "${NEXOPANEL_HOME}/backend/requirements.txt" && -d "${NEXOPANEL_HOME}/venv" ]]; then
+    "${NEXOPANEL_HOME}/venv/bin/pip" install --quiet -r "${NEXOPANEL_HOME}/backend/requirements.txt" || true
+  fi
+  # Ensure DNS zones directory and tools
+  mkdir -p /etc/bind/zones
+  chown -R bind:bind /etc/bind/zones 2>/dev/null || true
+  chmod 755 /etc/bind/zones 2>/dev/null || true
+  if ! command -v named-checkzone >/dev/null 2>&1; then
+    apt-get update -q && apt-get install -y -q bind9-utils dnsutils >/dev/null 2>&1 || true
+  fi
+  # Ensure ownership of prebuilt frontend output
+  if [[ -d "${NEXOPANEL_HOME}/frontend/.output" ]]; then
+    chown -R nexopanel:nexopanel "${NEXOPANEL_HOME}/frontend/.output" 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  timeout 15 systemctl restart nexopanel-daemon >/dev/null 2>&1 || systemctl start --no-block nexopanel-daemon >/dev/null 2>&1 || true
+  timeout 15 systemctl restart nexopanel >/dev/null 2>&1 || systemctl start --no-block nexopanel >/dev/null 2>&1 || true
+  log "✓ NexoPanel updated and restarted successfully!"
+fi

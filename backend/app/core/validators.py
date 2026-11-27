@@ -16,13 +16,13 @@ DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 # Grant host: an address, hostname, wildcard ("%", "192.168.0.%") or "localhost".
 DB_HOST_RE = re.compile(r"^[0-9A-Za-z_%][0-9A-Za-z_.:%-]{0,63}$")
 MYSQL_CHARSET_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
-PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,127}$")
+PACKAGE_NAME_RE = re.compile(r"^[a-z0-9*][a-z0-9+.:=~*-]{0,127}$")
 SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.@-]{1,64}$")
 QUEUE_ID_RE = re.compile(r"^[A-F0-9]{6,20}$")
 
 
 def validate_domain(value: str, allow_wildcard: bool = False) -> str:
-    domain = value.strip().lower()
+    domain = value.strip().lower().rstrip(".")
     if domain.startswith("*.") and not allow_wildcard:
         raise ValueError("Wildcard domains are not permitted in this context")
     if not DOMAIN_RE.match(domain):

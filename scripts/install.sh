@@ -91,7 +91,7 @@ apt-get install -y -q \
   ca-certificates curl git tar unzip gnupg lsb-release \
   nginx php-fpm \
   postfix postfix-pcre dovecot-core dovecot-imapd dovecot-pop3d opendkim opendkim-tools \
-  bind9 bind9utils \
+  bind9 bind9-utils dnsutils \
   mariadb-server postgresql \
   pure-ftpd \
   ufw fail2ban \
@@ -272,7 +272,7 @@ systemctl daemon-reload
 log "Enabling system services (non-blocking)..."
 SERVICES=(nginx mariadb postgresql postfix dovecot named bind9 fail2ban pure-ftpd nexopanel-daemon nexopanel)
 for svc in "${SERVICES[@]}"; do
-  systemctl enable "$svc" >/dev/null 2>&1 || true
+  timeout 5 systemctl enable "$svc" < /dev/null >/dev/null 2>&1 || true
 done
 
 log "Starting delegating system services with timeout guards..."

@@ -43,6 +43,9 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/apt-get",
     "/usr/bin/dpkg-query",
     "/usr/sbin/named-checkzone",
+    "/usr/bin/named-checkzone",
+    "/usr/sbin/named-checkconf",
+    "/usr/bin/named-checkconf",
     "/usr/sbin/postsuper",
     "/usr/sbin/postqueue",
     "/usr/sbin/postmap",
@@ -56,6 +59,16 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/docker",
     "/bin/cp",
     "/usr/bin/cp",
+    "/usr/bin/apt-cache",
+    "/usr/bin/add-apt-repository",
+    "/usr/bin/git",
+    "/usr/bin/curl",
+    "/bin/tar",
+    "/usr/bin/tar",
+    "/usr/bin/make",
+    "/usr/bin/cmake",
+    "/usr/bin/python3",
+    "/usr/bin/which",
 }
 
 ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
@@ -95,7 +108,7 @@ CP_ALLOWED_PREFIXES: tuple[str, ...] = (
 )
 
 SERVICE_UNIT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,63}(\.service)?$")
-PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.:-]{0,127}$")
+PACKAGE_NAME_RE = re.compile(r"^[a-z0-9*][a-z0-9+.:=~*-]{0,127}$")
 DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 ZONE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,253}$")
 DOCKER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
@@ -326,6 +339,15 @@ def _validate_named_checkzone(args: list[str]) -> str | None:
     return None
 
 
+def _validate_named_checkconf(args: list[str]) -> str | None:
+    for arg in args:
+        if arg in ("-z", "-p", "-v"):
+            continue
+        if not _is_allowed_path(arg):
+            return f"Configuration file not permitted: {arg}"
+    return None
+
+
 def _validate_postmap(args: list[str]) -> str | None:
     if len(args) != 1 or not _is_allowed_path(args[0]):
         return "postmap expects a single permitted map file"
@@ -490,6 +512,73 @@ def _validate_cp(args: list[str]) -> str | None:
     return None
 
 
+APT_CACHE_ACTIONS = {"search", "show", "policy", "pkgnames", "depends", "rdepends", "stats"}
+APT_CACHE_FLAGS = {"-q", "-qq", "--names-only", "-n", "--full", "--no-all-versions", "--recurse"}
+
+
+def _validate_apt_cache(args: list[str]) -> str | None:
+    if not args:
+        return "apt-cache requires an action"
+    action = args[0]
+    if action not in APT_CACHE_ACTIONS:
+        return f"Unsupported apt-cache action: {action}"
+    for arg in args[1:]:
+        if arg in APT_CACHE_FLAGS:
+            continue
+        if not re.match(r"^[a-zA-Z0-9.+:=-]{1,128}$", arg):
+            return f"Invalid apt-cache argument: {arg}"
+    return None
+
+
+def _validate_add_apt_repository(args: list[str]) -> str | None:
+    if not args:
+        return "add-apt-repository requires arguments"
+    for arg in args:
+        if arg in {"-y", "--yes", "-u", "--update", "-r", "--remove", "-s", "--sourceslist"}:
+            continue
+        if re.match(r"^ppa:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", arg) or arg.startswith("deb "):
+            continue
+        return f"Unsupported repository specification: {arg}"
+    return None
+
+
+def _validate_git(args: list[str]) -> str | None:
+    if not args:
+        return "git requires arguments"
+    action = args[0]
+    if action not in {"clone", "checkout", "pull", "fetch", "version", "--version", "rev-parse", "-c"}:
+        return f"Unsupported git action: {action}"
+    return None
+
+
+def _validate_curl(args: list[str]) -> str | None:
+    if not args:
+        return "curl requires arguments"
+    return None
+
+
+def _validate_tar(args: list[str]) -> str | None:
+    if not args:
+        return "tar requires arguments"
+    return None
+
+
+def _validate_make(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_cmake(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_python3(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_which(args: list[str]) -> str | None:
+    return None
+
+
 _EXEC_VALIDATORS = {
     "/bin/systemctl": _validate_systemctl,
     "/usr/bin/systemctl": _validate_systemctl,
@@ -497,6 +586,9 @@ _EXEC_VALIDATORS = {
     "/usr/bin/apt-get": _validate_apt_get,
     "/usr/bin/dpkg-query": _validate_dpkg_query,
     "/usr/sbin/named-checkzone": _validate_named_checkzone,
+    "/usr/bin/named-checkzone": _validate_named_checkzone,
+    "/usr/sbin/named-checkconf": _validate_named_checkconf,
+    "/usr/bin/named-checkconf": _validate_named_checkconf,
     "/usr/sbin/postmap": _validate_postmap,
     "/usr/sbin/postqueue": _validate_postqueue,
     "/usr/sbin/postsuper": _validate_postsuper,
@@ -510,6 +602,16 @@ _EXEC_VALIDATORS = {
     "/usr/bin/docker": _validate_docker,
     "/bin/cp": _validate_cp,
     "/usr/bin/cp": _validate_cp,
+    "/usr/bin/apt-cache": _validate_apt_cache,
+    "/usr/bin/add-apt-repository": _validate_add_apt_repository,
+    "/usr/bin/git": _validate_git,
+    "/usr/bin/curl": _validate_curl,
+    "/bin/tar": _validate_tar,
+    "/usr/bin/tar": _validate_tar,
+    "/usr/bin/make": _validate_make,
+    "/usr/bin/cmake": _validate_cmake,
+    "/usr/bin/python3": _validate_python3,
+    "/usr/bin/which": _validate_which,
 }
 
 
@@ -666,12 +768,15 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
         stdin_data = payload.get("stdin")
         if stdin_data is not None and not isinstance(stdin_data, str):
             return {"returncode": 1, "stdout": "", "stderr": "Invalid stdin payload"}
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return {"returncode": 127, "stdout": "", "stderr": f"Binary not found on system: {args[0]}"}
         try:
             out_b, err_b = await asyncio.wait_for(
                 proc.communicate(input=stdin_data.encode("utf-8") if stdin_data is not None else None),

@@ -391,6 +391,42 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     assert update_res.status_code == 200
     assert "text/event-stream" in update_res.headers.get("content-type", "")
 
+    # 7. Global APT package search & info
+    search_res = await client.get("/api/v1/system/packages/search?query=nginx", headers=admin_headers)
+    assert search_res.status_code == 200
+    assert "packages" in search_res.json()
+
+    # 8. Python runtimes detection
+    py_runtimes_res = await client.get("/api/v1/system/runtimes/python", headers=admin_headers)
+    assert py_runtimes_res.status_code == 200
+    py_runtimes = py_runtimes_res.json()
+    assert any(r["version"] == "3.12" for r in py_runtimes)
+    assert any(r["version"] == "3.13" for r in py_runtimes)
+
+    # 9. PHP and Python security update endpoints
+    php_sec_res = await client.post("/api/v1/system/packages/php/security-update", headers=admin_headers)
+    assert php_sec_res.status_code == 200
+    assert "text/event-stream" in php_sec_res.headers.get("content-type", "")
+
+    py_sec_res = await client.post("/api/v1/system/packages/python/security-update", headers=admin_headers)
+    assert py_sec_res.status_code == 200
+    assert "text/event-stream" in py_sec_res.headers.get("content-type", "")
+
+    # 10. Install from source endpoint
+    src_res = await client.post(
+        "/api/v1/system/packages/source/install",
+        headers=admin_headers,
+        json={
+            "name": "redis-test",
+            "source_type": "tarball",
+            "url": "https://download.redis.io/redis-stable.tar.gz",
+            "build_tool": "make",
+            "install_command": "true",
+        },
+    )
+    assert src_res.status_code == 200
+    assert "text/event-stream" in src_res.headers.get("content-type", "")
+
 
 
 async def test_dns_nameserver_setup_and_zone_health(client: AsyncClient, admin_headers: dict[str, str]):
@@ -426,6 +462,21 @@ async def test_dns_nameserver_setup_and_zone_health(client: AsyncClient, admin_h
     )
     assert zone.status_code == 201
     zone_id = zone.json()["id"]
+
+    # Test zone with email-formatted admin_email and trailing dot nameserver (alaqsamadrasah.com)
+    zone2 = await client.post(
+        "/api/v1/dns/zones",
+        headers=admin_headers,
+        json={
+            "domain": "alaqsamadrasah.com",
+            "primary_ns": "ns1.nexogiant.com.",
+            "secondary_ns": "ns2.nexogiant.com",
+            "admin_email": "hostmaster@localhost.localdomain",
+        },
+    )
+    assert zone2.status_code == 201
+    assert zone2.json()["domain"] == "alaqsamadrasah.com"
+
     zone_records = (await client.get(f"/api/v1/dns/zones/{zone_id}/records", headers=admin_headers)).json()
     assert len([r for r in zone_records if r["record_type"] == "NS"]) == 2
     await client.post(

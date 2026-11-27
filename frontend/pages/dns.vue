@@ -529,25 +529,32 @@
     <div v-if="showZoneModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div class="bg-white rounded-lg shadow-xl p-5 w-full max-w-md space-y-3">
         <h3 class="text-sm font-bold text-slate-900">Add Domain Zone</h3>
+        <div v-if="zoneError" class="p-2.5 rounded bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2">
+          <svg class="w-4 h-4 text-rose-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+          <span class="break-all">{{ zoneError }}</span>
+        </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Domain Name</label>
-          <input v-model="newZone.domain" placeholder="example.com" class="np-input" />
+          <input v-model="newZone.domain" placeholder="example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Primary Nameserver</label>
-          <input v-model="newZone.primary_ns" placeholder="ns1.example.com" class="np-input" />
+          <input v-model="newZone.primary_ns" placeholder="ns1.example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Secondary Nameserver <span class="text-slate-400">(recommended)</span></label>
-          <input v-model="newZone.secondary_ns" placeholder="ns2.example.com" class="np-input" />
+          <input v-model="newZone.secondary_ns" placeholder="ns2.example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Admin Email</label>
-          <input v-model="newZone.admin_email" placeholder="hostmaster@example.com" class="np-input" />
+          <input v-model="newZone.admin_email" placeholder="hostmaster@example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div class="flex justify-end gap-2 pt-2">
-          <button @click="showZoneModal = false" class="np-btn-secondary">Cancel</button>
-          <button @click="createZone" class="np-btn-primary">Create Zone</button>
+          <button @click="showZoneModal = false" :disabled="creatingZone" class="np-btn-secondary">Cancel</button>
+          <button @click="createZone" :disabled="creatingZone" class="np-btn-primary inline-flex items-center gap-1.5">
+            <svg v-if="creatingZone" class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+            <span>{{ creatingZone ? 'Creating Zone...' : 'Create Zone' }}</span>
+          </button>
         </div>
       </div>
     </div>
@@ -827,6 +834,9 @@ const healthError = ref('')
 const healthCache = ref<Record<number, any>>({})
 const testingAll = ref(false)
 
+const creatingZone = ref(false)
+const zoneError = ref('')
+
 const newZone = reactive({
   domain: '',
   primary_ns: 'ns1.localhost.localdomain',
@@ -1004,6 +1014,7 @@ async function refreshRecords() {
 }
 
 function openZoneModal() {
+  zoneError.value = ''
   newZone.domain = ''
   newZone.primary_ns = nameservers.value?.ns1 || 'ns1.localhost.localdomain'
   newZone.secondary_ns = nameservers.value?.ns2 || ''
@@ -1012,9 +1023,21 @@ function openZoneModal() {
 }
 
 async function createZone() {
-  await apiFetch('/dns/zones', { method: 'POST', body: newZone })
-  showZoneModal.value = false
-  await Promise.all([load(), loadNameservers()])
+  if (!newZone.domain || !newZone.domain.trim()) {
+    zoneError.value = 'Domain name is required.'
+    return
+  }
+  zoneError.value = ''
+  creatingZone.value = true
+  try {
+    await apiFetch('/dns/zones', { method: 'POST', body: newZone })
+    showZoneModal.value = false
+    await Promise.all([load(), loadNameservers()])
+  } catch (err: any) {
+    zoneError.value = err.message || 'Failed to create DNS zone. Please check named status and try again.'
+  } finally {
+    creatingZone.value = false
+  }
 }
 
 async function deleteZone(z: any) {

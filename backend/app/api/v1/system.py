@@ -5,11 +5,16 @@ import asyncio
 import json
 import os
 import platform
+import re
+import secrets
+import shutil
 import socket
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -39,6 +44,17 @@ class ServiceControlRequest(BaseModel):
 
 class PackageActionRequest(BaseModel):
     packages: list[str] = Field(min_length=1)
+
+
+class SourceInstallRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
+    source_type: Literal["tarball", "git"] = "tarball"
+    url: str = Field(min_length=5, max_length=1000)
+    branch_or_tag: str | None = None
+    configure_flags: str | None = None
+    build_tool: Literal["make", "cmake", "python", "custom"] = "make"
+    custom_build_command: str | None = None
+    install_command: str = "make install"
 
 
 class SettingUpdateRequest(BaseModel):
@@ -340,6 +356,46 @@ CURATED_STACK_CATALOG: list[dict[str, Any]] = [
         "icon": "cpu",
     },
     {
+        "slug": "python3.13",
+        "name": "Python 3.13 (Latest Stable)",
+        "category": "Python",
+        "description": "Latest Python 3.13 runtime with optional Free-threaded GIL and JIT performance compiler.",
+        "apt_packages": ["python3.13", "python3.13-venv", "python3.13-dev"],
+        "service": None,
+        "python_version": "3.13",
+        "icon": "cpu",
+    },
+    {
+        "slug": "python3.12",
+        "name": "Python 3.12 (Production Recommended)",
+        "category": "Python",
+        "description": "Production recommended Python 3.12 runtime with isolated subinterpreters and standard tooling.",
+        "apt_packages": ["python3.12", "python3.12-venv", "python3.12-dev"],
+        "service": None,
+        "python_version": "3.12",
+        "icon": "cpu",
+    },
+    {
+        "slug": "python3.11",
+        "name": "Python 3.11 (High Performance)",
+        "category": "Python",
+        "description": "Optimized Python 3.11 runtime featuring Faster CPython execution optimizations.",
+        "apt_packages": ["python3.11", "python3.11-venv", "python3.11-dev"],
+        "service": None,
+        "python_version": "3.11",
+        "icon": "cpu",
+    },
+    {
+        "slug": "python3.10",
+        "name": "Python 3.10 (Ubuntu LTS Stable)",
+        "category": "Python",
+        "description": "Standard Ubuntu LTS Python 3.10 runtime environment with structural pattern matching.",
+        "apt_packages": ["python3.10", "python3.10-venv", "python3.10-dev"],
+        "service": None,
+        "python_version": "3.10",
+        "icon": "cpu",
+    },
+    {
         "slug": "python3",
         "name": "Python 3 & venv",
         "category": "Runtime",
@@ -510,6 +566,45 @@ async def get_php_runtimes(_: User = Depends(require_permission("websites:read")
     return results
 
 
+@router.get("/runtimes/python")
+async def get_python_runtimes(_: User = Depends(require_permission("websites:read"))) -> list[dict]:
+    executor = get_node_executor()
+    versions = ["3.14", "3.13", "3.12", "3.11", "3.10"]
+    results = []
+
+    res = await executor.run_command(
+        ["/usr/bin/dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\n"]
+    )
+    installed_pkgs = set()
+    if res.ok:
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and "installed" in parts[2]:
+                installed_pkgs.add(parts[0])
+
+    for v in versions:
+        pkg_name = f"python{v}"
+        is_installed = pkg_name in installed_pkgs
+        binary_path = f"/usr/bin/python{v}"
+        detailed_version = ""
+        if is_installed:
+            v_res = await executor.run_command([binary_path, "--version"])
+            if v_res.ok:
+                detailed_version = (v_res.stdout.strip() or v_res.stderr.strip())
+
+        has_venv = f"python{v}-venv" in installed_pkgs
+        results.append({
+            "version": v,
+            "is_installed": is_installed,
+            "binary_path": binary_path,
+            "detailed_version": detailed_version or (f"Python {v} (Available)" if not is_installed else f"Python {v}"),
+            "has_venv": has_venv,
+            "label": f"Python {v} ({'Installed' if is_installed else 'Not Installed'})",
+        })
+
+    return results
+
+
 @router.post("/packages/curated/{slug}/install")
 async def install_curated_package(
     slug: str,
@@ -554,6 +649,20 @@ async def install_curated_package(
             ppa_res = await executor.run_command(["/usr/bin/add-apt-repository", "-y", "ppa:ondrej/php"])
             if ppa_res.ok:
                 yield f"data: {json.dumps({'line': '✓ Added ppa:ondrej/php. Updating APT repository index...'})}\n\n"
+                await executor.run_command(["/usr/bin/apt-get", "update", "-qq"])
+                yield f"data: {json.dumps({'line': f'Retrying installation of {pkg_name}...'})}\n\n"
+                res = await executor.run_command(cmd, timeout=600)
+                for line in (res.stdout + "\n" + res.stderr).splitlines():
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line})}\n\n"
+
+        # If Python package wasn't found in stock repo, attempt automatic Deadsnakes PPA setup
+        if not res.ok and target.get("category") == "Python" and distro.family == "debian":
+            yield f"data: {json.dumps({'line': 'Stock repositories do not have target Python packages. Configuring Deadsnakes Python PPA...'})}\n\n"
+            await executor.run_command(["/usr/bin/apt-get", "install", "-y", "-q", "software-properties-common", "ca-certificates"])
+            ppa_res = await executor.run_command(["/usr/bin/add-apt-repository", "-y", "ppa:deadsnakes/ppa"])
+            if ppa_res.ok:
+                yield f"data: {json.dumps({'line': '✓ Added ppa:deadsnakes/ppa. Updating APT repository index...'})}\n\n"
                 await executor.run_command(["/usr/bin/apt-get", "update", "-qq"])
                 yield f"data: {json.dumps({'line': f'Retrying installation of {pkg_name}...'})}\n\n"
                 res = await executor.run_command(cmd, timeout=600)
@@ -699,6 +808,361 @@ async def update_package_cache(
                 yield f"data: {json.dumps({'line': line})}\n\n"
         yield f"data: {json.dumps({'line': '✓ Package index update finished.' if res.ok else '✗ Update failed.'})}\n\n"
         yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.get("/packages/search")
+async def search_global_packages(
+    query: str = Query(min_length=1, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    _: User = Depends(require_permission("packages:read")),
+) -> dict:
+    executor = get_node_executor()
+    # Fetch locally installed package names to mark installed status
+    dpkg_res = await executor.run_command(["/usr/bin/dpkg-query", "-W", "-f=${Package}\n"])
+    installed_set = set(dpkg_res.stdout.splitlines()) if dpkg_res.ok else set()
+
+    clean_q = re.sub(r"[^a-zA-Z0-9.+:=-]", "", query.strip())
+    if not clean_q:
+        return {"packages": [], "total": 0}
+
+    # Query global APT archive
+    cache_res = await executor.run_command(["/usr/bin/apt-cache", "search", "--names-only", clean_q], timeout=15)
+    if not cache_res.ok or not cache_res.stdout.strip():
+        cache_res = await executor.run_command(["/usr/bin/apt-cache", "search", clean_q], timeout=15)
+
+    packages = []
+    if cache_res.ok:
+        for line in cache_res.stdout.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            parts = line_str.split(" - ", 1)
+            pkg_name = parts[0].strip()
+            desc = parts[1].strip() if len(parts) > 1 else ""
+            if not pkg_name:
+                continue
+            packages.append({
+                "name": pkg_name,
+                "description": desc,
+                "is_installed": pkg_name in installed_set,
+            })
+            if len(packages) >= limit:
+                break
+
+    return {"query": clean_q, "total": len(packages), "packages": packages}
+
+
+@router.get("/packages/info/{package_name}")
+async def get_package_info(
+    package_name: str,
+    _: User = Depends(require_permission("packages:read")),
+) -> dict:
+    clean_pkg = validate_package_name(package_name)
+    executor = get_node_executor()
+    res = await executor.run_command(["/usr/bin/apt-cache", "show", clean_pkg], timeout=10)
+    if not res.ok or not res.stdout.strip():
+        raise HTTPException(status_code=404, detail="Package details not found in APT repository")
+
+    info: dict[str, Any] = {"name": clean_pkg, "description": "", "raw": res.stdout}
+    for line in res.stdout.splitlines():
+        if line.startswith("Version: "):
+            info["version"] = line[9:].strip()
+        elif line.startswith("Installed-Size: "):
+            info["installed_size_kb"] = line[16:].strip()
+        elif line.startswith("Maintainer: "):
+            info["maintainer"] = line[12:].strip()
+        elif line.startswith("Homepage: "):
+            info["homepage"] = line[10:].strip()
+        elif line.startswith("Section: "):
+            info["section"] = line[9:].strip()
+        elif line.startswith("Depends: "):
+            info["depends"] = [d.strip() for d in line[9:].split(",")][:10]
+        elif line.startswith("Description: ") or line.startswith("Description-en: "):
+            info["description"] = line.split(": ", 1)[1].strip()
+
+    stat_res = await executor.run_command(["/usr/bin/dpkg-query", "-W", "-f=${Version}\t${Status}", clean_pkg])
+    info["is_installed"] = stat_res.ok and "installed" in stat_res.stdout
+    info["installed_version"] = stat_res.stdout.split("\t")[0].strip() if stat_res.ok else None
+
+    return info
+
+
+@router.post("/packages/php/security-update")
+async def update_php_security_versions(
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    executor = get_node_executor()
+    distro = get_distro_driver()
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action="update_php_security",
+        target_resource="php:security_updates",
+    )
+    await db.commit()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': '=== NexoPanel Security: Updating PHP Runtimes to Latest Security Patches ==='})}\n\n"
+        if distro.family == "debian":
+            yield f"data: {json.dumps({'line': '1. Checking Ondřej Surý PHP repository for modern security releases...'})}\n\n"
+            await executor.run_command(["/usr/bin/apt-get", "install", "-y", "-q", "software-properties-common", "ca-certificates"])
+            await executor.run_command(["/usr/bin/add-apt-repository", "-y", "ppa:ondrej/php"])
+
+        yield f"data: {json.dumps({'line': '2. Updating APT repository index...'})}\n\n"
+        await executor.run_command(["/usr/bin/apt-get", "update", "-qq"])
+
+        yield f"data: {json.dumps({'line': '3. Upgrading PHP packages to latest security releases...'})}\n\n"
+        dpkg_res = await executor.run_command(["/usr/bin/dpkg-query", "-W", "-f=${Package}\n"])
+        installed_php = [p.strip() for p in (dpkg_res.stdout or "").splitlines() if p.strip().startswith("php")]
+        if not installed_php:
+            installed_php = ["php-common", "php-fpm"]
+
+        upgrade_cmd = ["/usr/bin/apt-get", "install", "--only-upgrade", "-y", "-q"] + installed_php[:40]
+        res = await executor.run_command(upgrade_cmd, timeout=300)
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
+            if line.strip():
+                yield f"data: {json.dumps({'line': line})}\n\n"
+
+        yield f"data: {json.dumps({'line': '4. Restarting active PHP-FPM daemons...'})}\n\n"
+        for v in ["8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"]:
+            svc = f"php{v}-fpm"
+            try:
+                await executor.run_command(distro.build_service_control_cmd(svc, "restart"))
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'line': '✓ PHP runtime security update completed successfully!' if res.ok else '! Completed with warnings.'})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/packages/python/security-update")
+async def update_python_security_versions(
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    executor = get_node_executor()
+    distro = get_distro_driver()
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action="update_python_security",
+        target_resource="python:security_updates",
+    )
+    await db.commit()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': '=== NexoPanel Security: Updating Python Runtimes ==='})}\n\n"
+        if distro.family == "debian":
+            yield f"data: {json.dumps({'line': '1. Checking Deadsnakes Python security repository...'})}\n\n"
+            await executor.run_command(["/usr/bin/apt-get", "install", "-y", "-q", "software-properties-common", "ca-certificates"])
+            await executor.run_command(["/usr/bin/add-apt-repository", "-y", "ppa:deadsnakes/ppa"])
+
+        yield f"data: {json.dumps({'line': '2. Updating APT repository index...'})}\n\n"
+        await executor.run_command(["/usr/bin/apt-get", "update", "-qq"])
+
+        yield f"data: {json.dumps({'line': '3. Upgrading installed Python runtimes to latest security patch levels...'})}\n\n"
+        dpkg_res = await executor.run_command(["/usr/bin/dpkg-query", "-W", "-f=${Package}\n"])
+        installed_py = [p.strip() for p in (dpkg_res.stdout or "").splitlines() if p.strip().startswith("python3")]
+        if not installed_py:
+            installed_py = ["python3", "python3-pip", "python3-venv"]
+
+        upgrade_cmd = ["/usr/bin/apt-get", "install", "--only-upgrade", "-y", "-q"] + installed_py[:40]
+        res = await executor.run_command(upgrade_cmd, timeout=300)
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
+            if line.strip():
+                yield f"data: {json.dumps({'line': line})}\n\n"
+
+        yield f"data: {json.dumps({'line': '✓ Python runtimes upgraded to latest secure patch versions!' if res.ok else '! Python security update completed.'})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/packages/source/install")
+async def install_package_from_source(
+    body: SourceInstallRequest,
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    parsed_url = urlsplit(body.url)
+    if parsed_url.scheme not in {"http", "https", "git"}:
+        raise HTTPException(status_code=400, detail="Invalid source URL scheme. Must be http, https, or git.")
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "", body.name)[:32] or "custom"
+    build_id = f"np_build_{safe_name}_{secrets.token_hex(4)}"
+    build_dir = Path(tempfile.gettempdir()) / build_id
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action="install_from_source",
+        target_resource=f"source:{safe_name}",
+    )
+    await db.commit()
+
+    executor = get_node_executor()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': f'=== NexoPanel Source Compiler: Building {body.name} from Source ==='})}\n\n"
+        yield f"data: {json.dumps({'line': f'Source URL: {body.url}'})}\n\n"
+
+        # 1. Ensure compilation toolchain
+        yield f"data: {json.dumps({'line': '1. Checking compilation toolchain (make, gcc, g++, cmake, curl, tar, git)...'})}\n\n"
+        tc_pkgs = ["build-essential", "make", "gcc", "g++", "cmake", "pkg-config", "git", "curl", "tar"]
+        tc_res = await executor.run_command(["/usr/bin/apt-get", "install", "-y", "-q", *tc_pkgs], timeout=300)
+        if not tc_res.ok:
+            yield f"data: {json.dumps({'line': f'! Toolchain preparation notice: {tc_res.stderr or tc_res.stdout}'})}\n\n"
+
+        # 2. Workspace setup
+        yield f"data: {json.dumps({'line': f'2. Setting up build workspace in {build_dir}...'})}\n\n"
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # 3. Source Acquisition
+            if body.source_type == "git":
+                yield f"data: {json.dumps({'line': f'3. Cloning Git repository: {body.url}...'})}\n\n"
+                clone_cmd = ["/usr/bin/git", "clone", "--depth", "1"]
+                if body.branch_or_tag:
+                    clone_cmd.extend(["-b", body.branch_or_tag])
+                clone_cmd.extend([body.url, str(build_dir / "src")])
+                clone_res = await executor.run_command(clone_cmd, timeout=300)
+                for line in (clone_res.stdout + "\n" + clone_res.stderr).splitlines():
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line})}\n\n"
+                if not clone_res.ok:
+                    yield f"data: {json.dumps({'line': '✗ Failed to clone repository.'})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'returncode': clone_res.returncode})}\n\n"
+                    return
+                src_root = build_dir / "src"
+            else:
+                yield f"data: {json.dumps({'line': f'3. Downloading source archive: {body.url}...'})}\n\n"
+                archive_file = build_dir / "archive.tar"
+                dl_res = await executor.run_command(["/usr/bin/curl", "-fsSL", body.url, "-o", str(archive_file)], timeout=300)
+                if not dl_res.ok:
+                    yield f"data: {json.dumps({'line': f'✗ Download failed: {dl_res.stderr}'})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'returncode': dl_res.returncode})}\n\n"
+                    return
+
+                yield f"data: {json.dumps({'line': 'Extracting source archive...'})}\n\n"
+                extract_dir = build_dir / "src"
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                extract_res = await executor.run_command(["/bin/tar", "-xf", str(archive_file), "-C", str(extract_dir)], timeout=120)
+                if not extract_res.ok:
+                    await executor.run_command(["/usr/bin/tar", "-xf", str(archive_file), "-C", str(extract_dir)], timeout=120)
+
+                subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
+                src_root = subdirs[0] if len(subdirs) == 1 else extract_dir
+
+            yield f"data: {json.dumps({'line': f'✓ Source ready in {src_root}'})}\n\n"
+
+            # 4. Configure & Compile
+            yield f"data: {json.dumps({'line': '4. Compiling software from source...'})}\n\n"
+            if body.build_tool == "make":
+                conf_script = src_root / "configure"
+                if conf_script.exists():
+                    flags = (body.configure_flags or "").split()
+                    flags_str = " ".join(flags)
+                    yield f"data: {json.dumps({'line': f'Running ./configure {flags_str}...'})}\n\n"
+                    proc = await asyncio.create_subprocess_exec(
+                        str(conf_script), *flags,
+                        cwd=str(src_root),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out, err = await proc.communicate()
+                    for line in (out.decode("utf-8", "replace") + "\n" + err.decode("utf-8", "replace")).splitlines():
+                        if line.strip():
+                            yield f"data: {json.dumps({'line': line})}\n\n"
+                    if proc.returncode != 0:
+                        yield f"data: {json.dumps({'line': f'✗ ./configure failed with exit code {proc.returncode}'})}\n\n"
+                        yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode})}\n\n"
+                        return
+
+                yield f"data: {json.dumps({'line': f'Running make compilation jobs...'})}\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/bin/make", f"-j{min(os.cpu_count() or 1, 8)}",
+                    cwd=str(src_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                for line in (out.decode("utf-8", "replace") + "\n" + err.decode("utf-8", "replace")).splitlines():
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line})}\n\n"
+
+                inst_cmd_text = body.install_command or "make install"
+                yield f"data: {json.dumps({'line': f'Running {inst_cmd_text}...'})}\n\n"
+                inst_args = inst_cmd_text.split()
+                inst_bin = "/usr/bin/make" if inst_args[0] == "make" else inst_args[0]
+                inst_params = inst_args[1:] if inst_args[0] == "make" else inst_args
+                proc = await asyncio.create_subprocess_exec(
+                    inst_bin, *inst_params,
+                    cwd=str(src_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                for line in (out.decode("utf-8", "replace") + "\n" + err.decode("utf-8", "replace")).splitlines():
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line})}\n\n"
+
+            elif body.build_tool == "cmake":
+                yield f"data: {json.dumps({'line': 'Configuring with CMake...'})}\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/bin/cmake", "-B", "build", *(body.configure_flags or "").split(),
+                    cwd=str(src_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                yield f"data: {json.dumps({'line': out.decode('utf-8', 'replace')})}\n\n"
+
+                yield f"data: {json.dumps({'line': 'Compiling with CMake...'})}\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/bin/cmake", "--build", "build", f"-j{min(os.cpu_count() or 1, 8)}",
+                    cwd=str(src_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                yield f"data: {json.dumps({'line': out.decode('utf-8', 'replace')})}\n\n"
+
+                yield f"data: {json.dumps({'line': 'Installing with CMake...'})}\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/bin/cmake", "--install", "build",
+                    cwd=str(src_root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+                yield f"data: {json.dumps({'line': out.decode('utf-8', 'replace')})}\n\n"
+
+            yield f"data: {json.dumps({'line': f'🎉 Successfully compiled and installed {body.name} from source!'})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'returncode': 0})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'line': f'✗ Build error: {exc}'})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'returncode': 1})}\n\n"
+        finally:
+            try:
+                shutil.rmtree(build_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
