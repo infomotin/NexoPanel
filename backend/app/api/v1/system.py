@@ -109,9 +109,9 @@ async def telemetry_stream(websocket: WebSocket) -> None:
 async def get_service_statuses(_: User = Depends(require_permission("telemetry:read"))) -> list[dict]:
     distro = get_distro_driver()
     executor = get_node_executor()
-    services = ["nginx", "mariadb", "postgresql", "postfix", "dovecot", "bind9"]
+    core_services = ["nginx", "mariadb", "postgresql", "postfix", "dovecot", "bind9", "pure-ftpd", "redis-server", "docker", "fail2ban"]
     results = []
-    for svc in services:
+    for svc in core_services:
         res = await executor.run_command(distro.build_service_control_cmd(svc, "is-active"))
         status_str = res.stdout.strip() or ("active" if res.ok else "inactive")
         results.append({"name": svc, "status": status_str})
