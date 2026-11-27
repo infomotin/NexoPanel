@@ -1,0 +1,35 @@
+# Managed by NexoPanel Mail Stack
+smtpd_banner = $myhostname ESMTP NexoPanel Mail
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+compatibility_level = 3.6
+
+smtpd_tls_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+smtpd_tls_security_level=may
+smtp_tls_security_level=may
+
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+smtpd_sasl_auth_enable = yes
+smtpd_recipient_restrictions = permit_sasl_authenticated, permit_mynetworks, reject_unauth_destination
+
+virtual_mailbox_domains = /etc/postfix/virtual_mailbox_domains
+virtual_mailbox_base = /var/mail/vhosts
+virtual_mailbox_maps = hash:/etc/postfix/virtual_mailbox_maps
+virtual_alias_maps = hash:/etc/postfix/virtual_alias_maps
+virtual_minimum_uid = 5000
+virtual_uid_maps = static:5000
+virtual_gid_maps = static:5000
+
+sender_dependent_relayhost_maps = hash:/etc/postfix/sender_dependent_relayhost_maps
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+smtp_sasl_security_options = noanonymous
+smtp_sender_dependent_authentication = yes
+
+milter_protocol = 6
+milter_default_action = accept
+smtpd_milters = inet:localhost:8891
+non_smtpd_milters = inet:localhost:8891

@@ -1,0 +1,75 @@
+"""Application configuration using Pydantic Settings."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="NEXOPANEL_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    APP_NAME: str = "NexoPanel"
+    APP_VERSION: str = "1.0.0"
+    ENVIRONMENT: Literal["production", "development", "testing"] = "production"
+    DEBUG: bool = False
+
+    # Bind & Network
+    HOST: str = "0.0.0.0"
+    PORT: int = 8443
+    ALLOWED_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "https://localhost:8443"])
+
+    # Database (Bundled SQLite 3 WAL)
+    DATABASE_PATH: Path = Path("/var/lib/nexopanel/panel.db")
+    DATABASE_URL: str | None = None
+
+    # Secrets & Security
+    MASTER_KEY_PATH: Path = Path("/etc/nexopanel/master.key")
+    JWT_SECRET_KEY: str | None = None
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    CSRF_COOKIE_NAME: str = "nexopanel_csrf"
+    CSRF_HEADER_NAME: str = "X-CSRF-Token"
+
+    # Rate Limiting & Lockout
+    AUTH_RATE_LIMIT_WINDOW_SECONDS: int = 300
+    AUTH_RATE_LIMIT_MAX_ATTEMPTS: int = 10
+    AUTH_LOCKOUT_SECONDS: int = 900
+
+    # Privilege-separated Root Daemon
+    DAEMON_SOCKET_PATH: Path = Path("/run/nexopanel/daemon.sock")
+    DAEMON_USE_MOCK_EXECUTOR: bool = False
+
+    # Node Context (Single-Node default, Multi-Node ready)
+    LOCAL_NODE_ID: str = "local-node-01"
+
+    # OS Gate
+    SKIP_OS_CHECK: bool = False
+
+    # Paths
+    LOG_DIR: Path = Path("/var/log/nexopanel")
+    BACKUP_DIR: Path = Path("/var/backups/nexopanel")
+    WEB_ROOT_BASE: Path = Path("/var/www")
+    MAIL_DIR_BASE: Path = Path("/var/mail/vhosts")
+    ALLOWED_FILE_ROOTS: list[str] = Field(default_factory=lambda: ["/var/www", "/var/backups/nexopanel", "/etc/nginx/sites-available"])
+
+    # Terminal
+    TERMINAL_IDLE_TIMEOUT_SECONDS: int = 900
+
+    @property
+    def resolved_database_url(self) -> str:
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
+        return f"sqlite+aiosqlite:///{self.DATABASE_PATH}"
+
+
+settings = Settings()

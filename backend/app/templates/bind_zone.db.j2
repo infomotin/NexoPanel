@@ -1,0 +1,12 @@
+; Managed by NexoPanel DNS Engine
+$TTL {{ minimum_ttl }}
+@   IN  SOA {{ primary_ns }}. {{ admin_email }}. (
+        {{ serial }} ; Serial
+        {{ refresh }} ; Refresh
+        {{ retry }} ; Retry
+        {{ expire }} ; Expire
+        {{ minimum_ttl }} ) ; Negative Cache TTL
+
+{% for rec in records %}
+{{ rec.name }} {{ rec.ttl }} IN {{ rec.record_type }} {% if rec.priority is not none %}{{ rec.priority }} {% endif %}{{ rec.value }}
+{% endfor %}
