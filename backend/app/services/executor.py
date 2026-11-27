@@ -125,21 +125,34 @@ class LocalNodeExecutor(NodeExecutor):
         if payload.get("op") == "exec":
             args: list[str] = payload["args"]
             stdin_data = payload.get("stdin")
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out_b, err_b = await asyncio.wait_for(
-                proc.communicate(input=stdin_data.encode("utf-8") if stdin_data is not None else None),
-                timeout=timeout,
-            )
-            return ExecutionResult(
-                returncode=proc.returncode or 0,
-                stdout=out_b.decode("utf-8", errors="replace"),
-                stderr=err_b.decode("utf-8", errors="replace"),
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out_b, err_b = await asyncio.wait_for(
+                    proc.communicate(input=stdin_data.encode("utf-8") if stdin_data is not None else None),
+                    timeout=timeout,
+                )
+                return ExecutionResult(
+                    returncode=proc.returncode or 0,
+                    stdout=out_b.decode("utf-8", errors="replace"),
+                    stderr=err_b.decode("utf-8", errors="replace"),
+                )
+            except FileNotFoundError:
+                return ExecutionResult(
+                    returncode=127,
+                    stdout="",
+                    stderr=f"Executable not found: {args[0]}",
+                )
+            except Exception as exc:
+                return ExecutionResult(
+                    returncode=1,
+                    stdout="",
+                    stderr=str(exc),
+                )
         return ExecutionResult(returncode=1, stdout="", stderr="Privileged daemon socket unavailable")
 
     async def run_command(

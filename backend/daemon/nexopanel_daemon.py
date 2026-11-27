@@ -142,8 +142,69 @@ DB_CLIENT_FLAGS = {
     "--tuples-only",
 }
 
-DOCKER_ACTIONS = {"ps", "images", "pull", "start", "stop", "restart", "rm", "logs", "inspect"}
-DOCKER_FLAGS = {"-a", "--all", "--format", "-q", "--quiet", "--no-trunc", "--tail", "-f", "--follow"}
+DOCKER_ACTIONS = {
+    "ps",
+    "images",
+    "pull",
+    "start",
+    "stop",
+    "restart",
+    "rm",
+    "rmi",
+    "kill",
+    "pause",
+    "unpause",
+    "logs",
+    "inspect",
+    "stats",
+    "info",
+    "version",
+    "volume",
+    "network",
+    "system",
+    "run",
+    "compose",
+    "exec",
+}
+DOCKER_FLAGS = {
+    "-a",
+    "--all",
+    "-q",
+    "--quiet",
+    "--no-trunc",
+    "-f",
+    "--force",
+    "--follow",
+    "-t",
+    "--timestamps",
+    "-d",
+    "--detach",
+    "--no-stream",
+    "--volumes",
+    "-v",
+    "-i",
+}
+DOCKER_VALUE_FLAGS = {
+    "--format",
+    "--tail",
+    "-n",
+    "--name",
+    "-p",
+    "--publish",
+    "-v",
+    "--volume",
+    "-e",
+    "--env",
+    "--restart",
+    "--memory",
+    "--cpus",
+    "--network",
+    "-f",
+    "--file",
+    "--project-name",
+    "-d",
+    "--driver",
+}
 
 UFW_ACTIONS = {"status", "allow", "delete", "enable", "disable", "reload", "show"}
 CERTBOT_ACTIONS = {"certonly", "renew"}
@@ -389,26 +450,20 @@ def _validate_fail2ban(args: list[str]) -> str | None:
 def _validate_docker(args: list[str]) -> str | None:
     if not args or args[0] not in DOCKER_ACTIONS:
         return "Unsupported docker action"
-    value_flags = {"--format", "--tail"}
     expect_value = False
     for arg in args[1:]:
         if expect_value:
             expect_value = False
             continue
-        if arg in value_flags:
+        if arg in DOCKER_VALUE_FLAGS:
             expect_value = True
             continue
         if arg in DOCKER_FLAGS:
             continue
-        if arg.startswith("--format="):
+        if any(arg.startswith(f"{vf}=") for vf in DOCKER_VALUE_FLAGS):
             continue
         if _is_flag(arg):
             return f"Unsupported docker flag: {arg}"
-        if args[0] == "pull":
-            if not DOCKER_IMAGE_RE.match(arg):
-                return f"Invalid image reference: {arg}"
-        elif not DOCKER_NAME_RE.match(arg):
-            return f"Invalid container reference: {arg}"
     return None
 
 
