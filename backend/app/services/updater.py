@@ -29,19 +29,60 @@ _CACHE: dict[str, Any] = {"timestamp": 0.0, "data": None}
 
 def _repo_root() -> Path | None:
     """Return the git checkout root when the panel was installed from source."""
-    candidate = Path(__file__).resolve().parents[3]
-    return candidate if (candidate / ".git").exists() else None
+    candidates = [
+        Path(__file__).resolve().parents[3],
+        Path("/opt/nexopanel"),
+        Path.cwd(),
+    ]
+    for c in candidates:
+        if (c / ".git").exists():
+            return c
+    return None
+
+
+def _read_git_head_directly(root: Path) -> str | None:
+    """Read local git commit directly from .git/HEAD without invoking git subprocess."""
+    head_file = root / ".git" / "HEAD"
+    if not head_file.exists():
+        return None
+    try:
+        content = head_file.read_text(encoding="utf-8").strip()
+        if not content.startswith("ref:"):
+            if re.match(r"^[0-9a-f]{40}$", content, re.IGNORECASE):
+                return content
+            return None
+        ref_path = content.split(":", 1)[1].strip()
+        ref_file = root / ".git" / ref_path
+        if ref_file.exists():
+            ref_commit = ref_file.read_text(encoding="utf-8").strip()
+            if re.match(r"^[0-9a-f]{40}$", ref_commit, re.IGNORECASE):
+                return ref_commit
+        packed = root / ".git" / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("^"):
+                    continue
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref_path:
+                    return parts[0]
+    except Exception:
+        pass
+    return None
 
 
 async def _local_git_commit() -> str | None:
     root = _repo_root()
     if root is None:
         return None
+    direct = _read_git_head_directly(root)
+    if direct:
+        return direct
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
             "-c",
-            f"safe.directory={root}",
+            "safe.directory=*",
             "-C",
             str(root),
             "rev-parse",
@@ -50,12 +91,36 @@ async def _local_git_commit() -> str | None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0:
+            commit = stdout.decode("utf-8", errors="replace").strip()
+            if commit:
+                return commit
     except (OSError, asyncio.TimeoutError):
-        return None
-    if proc.returncode != 0:
-        return None
-    commit = stdout.decode("utf-8", errors="replace").strip()
-    return commit or None
+        pass
+    return None
+
+
+async def _remote_git_commit_via_ls_remote() -> str | None:
+    """Fallback using git ls-remote to check latest upstream commit without API rate limits."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-remote",
+            f"https://github.com/{settings.GITHUB_REPO}.git",
+            "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+        if proc.returncode == 0:
+            line = stdout.decode("utf-8", errors="replace").strip()
+            if line:
+                sha = line.split()[0]
+                if re.match(r"^[0-9a-f]{40}$", sha, re.IGNORECASE):
+                    return sha
+    except Exception:
+        pass
+    return None
 
 
 async def _github_json(path: str) -> tuple[Any | None, str | None]:
@@ -110,28 +175,34 @@ async def _build_update_status() -> dict[str, Any]:
     recent_commits = [_format_commit(item) for item in commits_data] if isinstance(commits_data, list) else []
     latest_commit = recent_commits[0]["sha"] if recent_commits else None
 
+    # Fallback to git ls-remote if GitHub REST API was rate-limited or unavailable
+    if not latest_commit:
+        latest_commit = await _remote_git_commit_via_ls_remote()
+
     release_data, _ = await _github_json("/releases/latest")
     latest_version = release_data.get("tag_name") if isinstance(release_data, dict) else None
 
     update_available = False
     commits_behind: int | None = None
-    error = commits_error
+    error = commits_error if not latest_commit else None
 
     if local_commit and latest_commit:
-        if local_commit == latest_commit:
+        if local_commit.strip().lower() == latest_commit.strip().lower():
+            update_available = False
             commits_behind = 0
         else:
+            # Installed commit and remote git are not same -> update available!
+            update_available = True
             compare, compare_error = await _github_json(
                 f"/compare/{local_commit}...{latest_commit}"
             )
             if isinstance(compare, dict):
-                commits_behind = int(compare.get("behind_by") or 0)
-                update_available = commits_behind > 0
+                # In GitHub API /compare/base...head: ahead_by is how many commits head is ahead of base
+                ahead = int(compare.get("ahead_by") or 0)
+                total = int(compare.get("total_commits") or 0)
+                commits_behind = max(ahead, total, 1)
             else:
-                # The comparison failed but we know the commits differ; surface
-                # the update rather than silently hiding it.
-                update_available = True
-                error = error or compare_error
+                commits_behind = len(recent_commits) if recent_commits else 1
     else:
         current = _version_tuple(settings.APP_VERSION)
         latest = _version_tuple(latest_version)

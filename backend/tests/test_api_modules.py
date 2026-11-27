@@ -498,6 +498,37 @@ async def test_dns_nameserver_setup_and_zone_health(client: AsyncClient, admin_h
     assert missing.status_code == 404
 
 
+async def test_system_updates_and_remote_git_comparison(client: AsyncClient, admin_headers: dict[str, str]):
+    from unittest.mock import patch
+    from app.core.config import settings
+
+    # 1. Test update check endpoint when disabled in test env
+    res = await client.get("/api/v1/system/updates?force=true", headers=admin_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert "update_available" in data
+    assert data["enabled"] is False
+
+    # 2. Test when enabled and installed / remote commits are different
+    with patch.object(settings, "UPDATE_CHECK_ENABLED", True), \
+         patch("app.services.updater._local_git_commit", return_value="1111111111111111111111111111111111111111"), \
+         patch("app.services.updater._github_json") as mock_gh:
+        mock_gh.side_effect = [
+            ([{"sha": "2222222222222222222222222222222222222222", "commit": {"message": "feat: new feature", "author": {"name": "test"}}}], None),
+            (None, None),  # releases
+            ({"status": "ahead", "ahead_by": 5, "behind_by": 0}, None),  # compare
+        ]
+        diff_res = await client.get("/api/v1/system/updates?force=true", headers=admin_headers)
+        assert diff_res.status_code == 200
+        diff_data = diff_res.json()
+        assert diff_data["update_available"] is True
+        assert diff_data["current_commit"] == "1111111111111111111111111111111111111111"
+        assert diff_data["latest_commit"] == "2222222222222222222222222222222222222222"
+        assert diff_data["commits_behind"] == 5
+        assert diff_data["enabled"] is True
+
+
+
 async def test_update_status_endpoint(client: AsyncClient, admin_headers: dict[str, str]):
     res = await client.get("/api/v1/system/updates", headers=admin_headers)
     assert res.status_code == 200

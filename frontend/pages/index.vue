@@ -3,54 +3,84 @@
     <!-- Upstream Update Notification -->
     <div
       v-if="updateInfo?.update_available && !updateDismissed"
-      class="rounded-lg border border-amber-300 bg-amber-50 p-4"
+      class="rounded-xl border border-amber-300 bg-gradient-to-r from-amber-50 to-orange-50 p-4 shadow-sm"
     >
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div class="flex items-start gap-3">
-          <div class="w-8 h-8 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
-            <ArrowUpCircle class="w-5 h-5" />
+          <div class="w-9 h-9 rounded-full bg-amber-100 border border-amber-300 text-amber-700 flex items-center justify-center shrink-0 mt-0.5">
+            <ArrowUpCircle class="w-5 h-5 text-amber-600 animate-bounce" />
           </div>
           <div>
-            <p class="text-sm font-bold text-amber-900">Update available for NexoPanel</p>
-            <p class="text-[11px] text-amber-800 mt-0.5">
-              Installed
-              <span class="font-mono">{{ updateInfo.current_commit_short || 'v' + updateInfo.current_version }}</span>
-              · Upstream
-              <span class="font-mono">{{ updateInfo.latest_commit_short || updateInfo.latest_version }}</span>
-              <span v-if="updateInfo.commits_behind"> · {{ updateInfo.commits_behind }} commit(s) behind</span>
+            <div class="flex items-center gap-2">
+              <span class="text-sm font-bold text-amber-950">NexoPanel Update Available</span>
+              <span class="px-2 py-0.5 text-[10px] font-bold rounded-full bg-amber-200 text-amber-800 uppercase tracking-wide">
+                {{ updateInfo.commits_behind ? `${updateInfo.commits_behind} commits behind` : 'New Version' }}
+              </span>
+            </div>
+            <p class="text-[12px] text-amber-900 mt-1">
+              Currently Installed:
+              <span class="font-mono font-semibold bg-white/70 px-1.5 py-0.5 rounded border border-amber-200">{{ updateInfo.current_commit_short || 'v' + updateInfo.current_version }}</span>
+              <span class="mx-1.5">➔</span>
+              Latest Remote Git:
+              <span class="font-mono font-semibold bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded border border-emerald-300">{{ updateInfo.latest_commit_short || updateInfo.latest_version }}</span>
             </p>
             <p v-if="updateInfo.latest_commit_message" class="text-[11px] text-amber-800 mt-1">
-              Latest: <span class="font-medium">{{ updateInfo.latest_commit_message }}</span>
+              Latest commit: <span class="font-medium text-slate-900">{{ updateInfo.latest_commit_message }}</span>
             </p>
-            <div v-if="updateInfo.recent_commits?.length" class="mt-2 space-y-0.5">
-              <p class="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Recent upstream commits</p>
+            <div v-if="updateInfo.recent_commits?.length" class="mt-2.5 space-y-1">
+              <p class="text-[10px] font-bold uppercase tracking-wider text-amber-900">Upstream Changes on main:</p>
               <div
                 v-for="c in updateInfo.recent_commits.slice(0, 3)"
                 :key="c.sha"
-                class="flex items-center gap-2 text-[11px] text-amber-900"
+                class="flex items-center gap-2 text-[11px] text-slate-800 bg-white/60 p-1.5 rounded border border-amber-200/60"
               >
-                <span class="font-mono text-[10px] bg-amber-100 rounded px-1 shrink-0">{{ c.short_sha }}</span>
-                <span class="truncate">{{ c.message }}</span>
+                <span class="font-mono text-[10px] bg-amber-100 text-amber-800 rounded px-1.5 py-0.5 font-semibold shrink-0">{{ c.short_sha }}</span>
+                <span class="truncate font-medium flex-1">{{ c.message }}</span>
               </div>
             </div>
           </div>
         </div>
-        <div class="flex items-center gap-2">
-          <a :href="updateInfo.repo_url" target="_blank" rel="noopener" class="np-btn-secondary">View changes</a>
+        <div class="flex flex-wrap items-center gap-2">
+          <NuxtLink to="/terminal" class="np-btn-primary inline-flex items-center gap-1.5">
+            <Terminal class="w-3.5 h-3.5" />
+            <span>Open Terminal</span>
+          </NuxtLink>
+          <a :href="updateInfo.repo_url" target="_blank" rel="noopener" class="np-btn-secondary">GitHub</a>
+          <button @click="loadUpdateStatus(true)" :disabled="checkingUpdate" class="np-btn-secondary">
+            {{ checkingUpdate ? 'Checking...' : 'Check Again' }}
+          </button>
           <button @click="dismissUpdate" class="np-btn-secondary">Dismiss</button>
         </div>
       </div>
-      <div class="mt-3 rounded border border-amber-200 bg-white/70 p-2.5">
-        <p class="text-[11px] font-semibold text-slate-700">How to update (run on the server as root):</p>
-        <div class="flex items-center gap-2 mt-1">
-          <code class="flex-1 text-[11px] font-mono text-slate-800 break-all">{{ updateInfo.update_command }}</code>
-          <button @click="copyUpdateCommand" class="text-emerald-700 hover:underline text-[11px] font-medium shrink-0">
-            {{ copied ? 'Copied' : 'Copy' }}
+      <div class="mt-3.5 rounded-lg border border-amber-200 bg-white p-3 space-y-1.5">
+        <p class="text-[11px] font-semibold text-slate-800">To apply updates in 5 seconds without rebuild downtime:</p>
+        <div class="flex items-center gap-2">
+          <code class="flex-1 text-[11px] font-mono bg-slate-900 text-emerald-400 p-2 rounded break-all select-all font-semibold">{{ updateInfo.update_command }}</code>
+          <button @click="copyUpdateCommand" class="np-btn-secondary shrink-0 text-emerald-700 font-medium">
+            {{ copied ? '✓ Copied' : 'Copy' }}
           </button>
         </div>
-        <p class="text-[10px] text-slate-500 mt-1">
-          Installed from a release tarball (no git checkout)? Reinstall with the one-line installer instead.
-        </p>
+      </div>
+    </div>
+
+    <!-- Persistent Mini Pill if dismissed but update still available -->
+    <div
+      v-else-if="updateInfo?.update_available && updateDismissed"
+      class="flex items-center justify-between p-3 rounded-lg bg-amber-50 border border-amber-300 text-xs text-amber-950 shadow-sm"
+    >
+      <div class="flex items-center gap-2">
+        <span class="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse"></span>
+        <span class="font-semibold">NexoPanel Update Available:</span>
+        <span class="font-mono text-[11px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded font-semibold">{{ updateInfo.latest_commit_short }}</span>
+        <span v-if="updateInfo.commits_behind" class="text-amber-800 font-medium">({{ updateInfo.commits_behind }} commits behind)</span>
+      </div>
+      <div class="flex items-center gap-3">
+        <button @click="updateDismissed = false" class="text-emerald-700 font-semibold hover:underline">
+          View Details & Update
+        </button>
+        <button @click="loadUpdateStatus(true)" :disabled="checkingUpdate" class="text-slate-500 hover:text-slate-800">
+          {{ checkingUpdate ? 'Checking...' : 'Recheck' }}
+        </button>
       </div>
     </div>
     <div
@@ -167,7 +197,7 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowUpCircle } from 'lucide-vue-next'
+import { ArrowUpCircle, Terminal } from 'lucide-vue-next'
 import { useAuthStore } from '~/stores/auth'
 
 const { apiFetch, wsBase } = useApi()
@@ -179,6 +209,7 @@ const auditLogs = ref<any[]>([])
 const cpuHistory = ref<number[]>([15, 22, 18, 25, 20, 30, 24, 19])
 const updateInfo = ref<any>(null)
 const updateDismissed = ref(false)
+const checkingUpdate = ref(false)
 const copied = ref(false)
 let ws: WebSocket | null = null
 
@@ -227,13 +258,18 @@ async function controlSvc(service: string, action: string) {
 }
 
 async function loadUpdateStatus(force = false) {
+  if (force) checkingUpdate.value = true
   try {
     updateInfo.value = await apiFetch<any>(`/system/updates${force ? '?force=true' : ''}`)
-    if (typeof localStorage !== 'undefined' && updateInfo.value?.latest_commit) {
+    if (force) {
+      updateDismissed.value = false
+    } else if (typeof localStorage !== 'undefined' && updateInfo.value?.latest_commit) {
       updateDismissed.value = localStorage.getItem('np_update_dismissed') === updateInfo.value.latest_commit
     }
   } catch {
     updateInfo.value = null
+  } finally {
+    checkingUpdate.value = false
   }
 }
 
