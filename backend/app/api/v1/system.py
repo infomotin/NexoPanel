@@ -8,6 +8,7 @@ import platform
 import socket
 import time
 from pathlib import Path
+from typing import Any
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -145,7 +146,493 @@ async def control_service(
     return {"ok": res.ok, "stdout": res.stdout, "stderr": res.stderr}
 
 
-# --- System Package Manager (apt) ---
+# --- System Package Manager (apt) & Curated Software Catalog ---
+
+CURATED_STACK_CATALOG: list[dict[str, Any]] = [
+    {
+        "slug": "nginx",
+        "name": "Nginx Web Server",
+        "category": "Web Server",
+        "description": "High performance asynchronous HTTP server, reverse proxy, and SSL/TLS terminator.",
+        "apt_packages": ["nginx"],
+        "service": "nginx",
+        "icon": "globe",
+    },
+    {
+        "slug": "apache2",
+        "name": "Apache HTTP Server",
+        "category": "Web Server",
+        "description": "Traditional Apache2 web server with .htaccess support and modular architecture.",
+        "apt_packages": ["apache2"],
+        "service": "apache2",
+        "icon": "globe",
+    },
+    {
+        "slug": "php8.4",
+        "name": "PHP 8.4 (FPM)",
+        "category": "PHP",
+        "description": "Latest PHP 8.4 runtime with PHP-FPM and standard extensions (mysql, curl, mbstring, xml, zip, gd, opcache).",
+        "apt_packages": ["php8.4-fpm", "php8.4-cli", "php8.4-mysql", "php8.4-curl", "php8.4-mbstring", "php8.4-xml", "php8.4-zip", "php8.4-gd", "php8.4-opcache"],
+        "service": "php8.4-fpm",
+        "php_version": "8.4",
+        "icon": "file-code",
+    },
+    {
+        "slug": "php8.3",
+        "name": "PHP 8.3 (FPM)",
+        "category": "PHP",
+        "description": "Production PHP 8.3 runtime with PHP-FPM and standard web extensions.",
+        "apt_packages": ["php8.3-fpm", "php8.3-cli", "php8.3-mysql", "php8.3-curl", "php8.3-mbstring", "php8.3-xml", "php8.3-zip", "php8.3-gd", "php8.3-opcache"],
+        "service": "php8.3-fpm",
+        "php_version": "8.3",
+        "icon": "file-code",
+    },
+    {
+        "slug": "php8.2",
+        "name": "PHP 8.2 (FPM)",
+        "category": "PHP",
+        "description": "Ubuntu LTS default PHP 8.2 runtime with PHP-FPM and standard web extensions.",
+        "apt_packages": ["php8.2-fpm", "php8.2-cli", "php8.2-mysql", "php8.2-curl", "php8.2-mbstring", "php8.2-xml", "php8.2-zip", "php8.2-gd"],
+        "service": "php8.2-fpm",
+        "php_version": "8.2",
+        "icon": "file-code",
+    },
+    {
+        "slug": "php8.1",
+        "name": "PHP 8.1 (FPM)",
+        "category": "PHP",
+        "description": "PHP 8.1 runtime for legacy applications and frameworks.",
+        "apt_packages": ["php8.1-fpm", "php8.1-cli", "php8.1-mysql", "php8.1-curl", "php8.1-mbstring", "php8.1-xml", "php8.1-zip"],
+        "service": "php8.1-fpm",
+        "php_version": "8.1",
+        "icon": "file-code",
+    },
+    {
+        "slug": "php8.0",
+        "name": "PHP 8.0 (FPM)",
+        "category": "PHP",
+        "description": "PHP 8.0 runtime for legacy web applications.",
+        "apt_packages": ["php8.0-fpm", "php8.0-cli", "php8.0-mysql", "php8.0-curl", "php8.0-mbstring", "php8.0-xml", "php8.0-zip"],
+        "service": "php8.0-fpm",
+        "php_version": "8.0",
+        "icon": "file-code",
+    },
+    {
+        "slug": "php7.4",
+        "name": "PHP 7.4 (FPM)",
+        "category": "PHP",
+        "description": "Legacy PHP 7.4 runtime for older WordPress plugins and codebases.",
+        "apt_packages": ["php7.4-fpm", "php7.4-cli", "php7.4-mysql", "php7.4-curl", "php7.4-mbstring", "php7.4-xml", "php7.4-zip"],
+        "service": "php7.4-fpm",
+        "php_version": "7.4",
+        "icon": "file-code",
+    },
+    {
+        "slug": "mariadb",
+        "name": "MariaDB Server",
+        "category": "Database",
+        "description": "High-performance drop-in replacement for MySQL relational database server.",
+        "apt_packages": ["mariadb-server", "mariadb-client"],
+        "service": "mariadb",
+        "icon": "database",
+    },
+    {
+        "slug": "mysql",
+        "name": "MySQL Server",
+        "category": "Database",
+        "description": "Oracle MySQL relational database management system.",
+        "apt_packages": ["mysql-server"],
+        "service": "mysql",
+        "icon": "database",
+    },
+    {
+        "slug": "postgresql",
+        "name": "PostgreSQL",
+        "category": "Database",
+        "description": "Advanced open-source object-relational database management system.",
+        "apt_packages": ["postgresql", "postgresql-contrib"],
+        "service": "postgresql",
+        "icon": "database",
+    },
+    {
+        "slug": "redis",
+        "name": "Redis In-Memory Cache",
+        "category": "Database",
+        "description": "In-memory data structure store used as a database, cache, and message broker.",
+        "apt_packages": ["redis-server"],
+        "service": "redis-server",
+        "icon": "database",
+    },
+    {
+        "slug": "memcached",
+        "name": "Memcached Object Store",
+        "category": "Database",
+        "description": "High-performance distributed memory caching system for accelerating dynamic web apps.",
+        "apt_packages": ["memcached"],
+        "service": "memcached",
+        "icon": "database",
+    },
+    {
+        "slug": "pure-ftpd",
+        "name": "Pure-FTPd Server",
+        "category": "FTP",
+        "description": "Secure production-grade FTP daemon with virtual database isolation and TLS encryption.",
+        "apt_packages": ["pure-ftpd"],
+        "service": "pure-ftpd",
+        "icon": "hard-drive",
+    },
+    {
+        "slug": "nodejs",
+        "name": "Node.js & NPM",
+        "category": "Runtime",
+        "description": "Event-driven JavaScript runtime and package manager for SSR and microservices.",
+        "apt_packages": ["nodejs", "npm"],
+        "service": None,
+        "icon": "cpu",
+    },
+    {
+        "slug": "python3",
+        "name": "Python 3 & venv",
+        "category": "Runtime",
+        "description": "Python 3 programming environment with pip package installer and virtual environments.",
+        "apt_packages": ["python3", "python3-pip", "python3-venv"],
+        "service": None,
+        "icon": "cpu",
+    },
+    {
+        "slug": "composer",
+        "name": "Composer PHP Manager",
+        "category": "Tools",
+        "description": "Standard dependency and library manager for PHP projects and frameworks.",
+        "apt_packages": ["composer"],
+        "service": None,
+        "icon": "tool",
+    },
+    {
+        "slug": "supervisor",
+        "name": "Supervisor Process Manager",
+        "category": "Tools",
+        "description": "System for monitoring and controlling background daemon processes and worker queues.",
+        "apt_packages": ["supervisor"],
+        "service": "supervisor",
+        "icon": "cpu",
+    },
+    {
+        "slug": "docker",
+        "name": "Docker Engine",
+        "category": "Tools",
+        "description": "Container runtime platform for running Docker containers and Compose environments.",
+        "apt_packages": ["docker.io"],
+        "service": "docker",
+        "icon": "container",
+    },
+    {
+        "slug": "ufw",
+        "name": "UFW Firewall",
+        "category": "Security",
+        "description": "Host-based packet filtering firewall configuration tool.",
+        "apt_packages": ["ufw"],
+        "service": "ufw",
+        "icon": "flame",
+    },
+    {
+        "slug": "fail2ban",
+        "name": "Fail2ban Defense",
+        "category": "Security",
+        "description": "Automated brute-force intrusion prevention analyzing system and authentication logs.",
+        "apt_packages": ["fail2ban"],
+        "service": "fail2ban",
+        "icon": "shield",
+    },
+    {
+        "slug": "certbot",
+        "name": "Certbot (Let's Encrypt)",
+        "category": "Security",
+        "description": "Automated ACME client for issuing and renewing free SSL/TLS certificates.",
+        "apt_packages": ["certbot", "python3-certbot-nginx"],
+        "service": None,
+        "icon": "key",
+    },
+    {
+        "slug": "git",
+        "name": "Git SCM",
+        "category": "Tools",
+        "description": "Fast and distributed version control system for web deployments.",
+        "apt_packages": ["git"],
+        "service": None,
+        "icon": "tool",
+    },
+]
+
+
+@router.get("/packages/catalog")
+async def get_curated_packages_catalog(
+    category: str = Query(default="ALL"),
+    search: str = Query(default=""),
+    _: User = Depends(require_permission("packages:read")),
+) -> list[dict]:
+    executor = get_node_executor()
+    distro = get_distro_driver()
+
+    res = await executor.run_command(
+        ["/usr/bin/dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\n"]
+    )
+    installed_map: dict[str, dict[str, str]] = {}
+    if res.ok:
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and "installed" in parts[2]:
+                installed_map[parts[0]] = {"version": parts[1], "status": parts[2]}
+
+    results = []
+    for item in CURATED_STACK_CATALOG:
+        cat_match = category == "ALL" or category == "Installed" or item["category"].lower() == category.lower()
+        if not cat_match:
+            continue
+        if search:
+            s = search.lower()
+            if s not in item["name"].lower() and s not in item["description"].lower() and s not in item["slug"].lower():
+                continue
+
+        primary_pkg = item["apt_packages"][0]
+        is_installed = primary_pkg in installed_map
+        version = installed_map[primary_pkg]["version"] if is_installed else None
+
+        service_status = "none"
+        if is_installed and item.get("service"):
+            try:
+                svc_cmd = distro.build_service_control_cmd(item["service"], "is-active")
+                svc_res = await executor.run_command(svc_cmd)
+                service_status = svc_res.stdout.strip() or ("active" if svc_res.ok else "inactive")
+            except Exception:
+                service_status = "inactive"
+
+        if category == "Installed" and not is_installed:
+            continue
+
+        results.append({
+            **item,
+            "is_installed": is_installed,
+            "version": version,
+            "service_status": service_status,
+        })
+
+    return results
+
+
+@router.get("/runtimes/php")
+async def get_php_runtimes(_: User = Depends(require_permission("websites:read"))) -> list[dict]:
+    executor = get_node_executor()
+    distro = get_distro_driver()
+    versions = ["8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"]
+    results = []
+
+    res = await executor.run_command(
+        ["/usr/bin/dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\n"]
+    )
+    installed_pkgs = set()
+    if res.ok:
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and "installed" in parts[2]:
+                installed_pkgs.add(parts[0])
+
+    for v in versions:
+        fpm_pkg = f"php{v}-fpm"
+        is_installed = fpm_pkg in installed_pkgs
+        service_status = "inactive"
+        if is_installed:
+            try:
+                svc_cmd = distro.build_service_control_cmd(fpm_pkg, "is-active")
+                svc_res = await executor.run_command(svc_cmd)
+                service_status = svc_res.stdout.strip() or ("active" if svc_res.ok else "inactive")
+            except Exception:
+                service_status = "inactive"
+
+        status_text = "Running" if service_status == "active" else ("Installed" if is_installed else "Not Installed")
+        results.append({
+            "version": v,
+            "is_installed": is_installed,
+            "socket": f"/run/php/php{v}-fpm.sock",
+            "service_status": service_status,
+            "label": f"PHP {v} ({status_text})",
+        })
+
+    return results
+
+
+@router.post("/packages/curated/{slug}/install")
+async def install_curated_package(
+    slug: str,
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    target = next((item for item in CURATED_STACK_CATALOG if item["slug"] == slug), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Curated software package not found")
+
+    distro = get_distro_driver()
+    executor = get_node_executor()
+    validated = [validate_package_name(p) for p in target["apt_packages"]]
+    cmd = distro.build_install_package_cmd(validated)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action=f"install_curated_{slug}",
+        target_resource=slug,
+    )
+    await db.commit()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Installer: Installing {target[\"name\"]} ==='})}\n\n"
+        yield f"data: {json.dumps({'line': f'Running command: {\" \".join(cmd)}'})}\n\n"
+        res = await executor.run_command(cmd, timeout=600)
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
+            if line.strip():
+                yield f"data: {json.dumps({'line': line})}\n\n"
+
+        if res.ok:
+            yield f"data: {json.dumps({'line': '✓ APT packages installed successfully.'})}\n\n"
+            svc = target.get("service")
+            if svc:
+                yield f"data: {json.dumps({'line': f'Configuring and starting systemd service: {svc}...'})}\n\n"
+                try:
+                    enable_cmd = distro.build_service_control_cmd(svc, "enable")
+                    start_cmd = distro.build_service_control_cmd(svc, "restart")
+                    await executor.run_command(enable_cmd)
+                    start_res = await executor.run_command(start_cmd)
+                    if start_res.ok:
+                        yield f"data: {json.dumps({'line': f'✓ Service {svc} is now active and operational.'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'line': f'! Service restart: {start_res.stderr or start_res.stdout}'})}\n\n"
+                except Exception as ex:
+                    yield f"data: {json.dumps({'line': f'! Post-install service step: {ex}'})}\n\n"
+
+            yield f"data: {json.dumps({'line': f'🎉 Installation of {target[\"name\"]} complete and integrated with NexoPanel!'})}\n\n"
+        else:
+            yield f"data: {json.dumps({'line': f'✗ Installation failed with exit code {res.returncode}'})}\n\n"
+
+        yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/packages/curated/{slug}/uninstall")
+async def uninstall_curated_package(
+    slug: str,
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    target = next((item for item in CURATED_STACK_CATALOG if item["slug"] == slug), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Curated software package not found")
+
+    distro = get_distro_driver()
+    executor = get_node_executor()
+    validated = [validate_package_name(p) for p in target["apt_packages"]]
+    cmd = distro.build_remove_package_cmd(validated)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action=f"uninstall_curated_{slug}",
+        target_resource=slug,
+    )
+    await db.commit()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': f'=== NexoPanel Package Manager: Removing {target[\"name\"]} ==='})}\n\n"
+        svc = target.get("service")
+        if svc:
+            yield f"data: {json.dumps({'line': f'Stopping service: {svc}...'})}\n\n"
+            try:
+                stop_cmd = distro.build_service_control_cmd(svc, "stop")
+                await executor.run_command(stop_cmd)
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'line': f'Running command: {\" \".join(cmd)}'})}\n\n"
+        res = await executor.run_command(cmd, timeout=300)
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
+            if line.strip():
+                yield f"data: {json.dumps({'line': line})}\n\n"
+
+        if res.ok:
+            yield f"data: {json.dumps({'line': f'✓ {target[\"name\"]} was cleanly uninstalled.'})}\n\n"
+        else:
+            yield f"data: {json.dumps({'line': f'✗ Removal exited with code {res.returncode}'})}\n\n"
+
+        yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/packages/curated/{slug}/control")
+async def control_curated_package_service(
+    slug: str,
+    body: ServiceControlRequest,
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    target = next((item for item in CURATED_STACK_CATALOG if item["slug"] == slug), None)
+    if not target or not target.get("service"):
+        raise HTTPException(status_code=400, detail="Package has no associated system service")
+
+    distro = get_distro_driver()
+    executor = get_node_executor()
+    cmd = distro.build_service_control_cmd(target["service"], body.action)
+    res = await executor.run_command(cmd)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action=f"package_service_{body.action}",
+        target_resource=f"{slug}:{target['service']}",
+        status="success" if res.ok else "failed",
+    )
+    await db.commit()
+    return {"ok": res.ok, "stdout": res.stdout, "stderr": res.stderr}
+
+
+@router.post("/packages/update-cache")
+async def update_package_cache(
+    request: Request,
+    actor: User = Depends(require_permission("packages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    executor = get_node_executor()
+    cmd = ["/usr/bin/apt-get", "update", "-q"]
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="packages:write",
+        action="apt_update_cache",
+        target_resource="apt-cache",
+    )
+    await db.commit()
+
+    async def event_stream():
+        yield f"data: {json.dumps({'line': '=== Updating APT Package Repository Index (apt-get update) ==='})}\n\n"
+        res = await executor.run_command(cmd, timeout=300)
+        for line in (res.stdout + "\n" + res.stderr).splitlines():
+            if line.strip():
+                yield f"data: {json.dumps({'line': line})}\n\n"
+        yield f"data: {json.dumps({'line': '✓ Package index update finished.' if res.ok else '✗ Update failed.'})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'returncode': res.returncode})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 @router.get("/packages")
 async def list_installed_packages(

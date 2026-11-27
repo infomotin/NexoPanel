@@ -63,6 +63,7 @@ class DebianFamilyDriver(BaseDistroDriver):
 
     _SERVICE_MAP: dict[str, str] = {
         "nginx": "nginx",
+        "apache2": "apache2",
         "postfix": "postfix",
         "dovecot": "dovecot",
         "opendkim": "opendkim",
@@ -70,10 +71,23 @@ class DebianFamilyDriver(BaseDistroDriver):
         "mariadb": "mariadb",
         "mysql": "mariadb",
         "postgresql": "postgresql",
+        "redis-server": "redis-server",
+        "redis": "redis-server",
+        "memcached": "memcached",
+        "pure-ftpd": "pure-ftpd",
+        "docker": "docker",
+        "supervisor": "supervisor",
+        "ufw": "ufw",
+        "fail2ban": "fail2ban",
         "bind9": "named",
         "named": "named",
+        "php7.4-fpm": "php7.4-fpm",
+        "php8.0-fpm": "php8.0-fpm",
+        "php8.1-fpm": "php8.1-fpm",
         "php8.2-fpm": "php8.2-fpm",
         "php8.3-fpm": "php8.3-fpm",
+        "php8.4-fpm": "php8.4-fpm",
+        "php8.5-fpm": "php8.5-fpm",
         "nexopanel": "nexopanel",
     }
 
@@ -121,7 +135,7 @@ class DebianFamilyDriver(BaseDistroDriver):
         return ["/usr/bin/apt-get", "upgrade", "-y", "-q"]
 
     def build_service_control_cmd(self, service: str, action: str) -> list[str]:
-        if action not in {"start", "stop", "restart", "reload", "status", "is-active"}:
+        if action not in {"start", "stop", "restart", "reload", "status", "is-active", "enable", "disable"}:
             raise ValueError(f"Invalid systemd action: {action!r}")
         unit = self.service_unit_name(service)
         return ["/bin/systemctl", action, unit]
