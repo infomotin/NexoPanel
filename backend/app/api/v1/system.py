@@ -724,7 +724,18 @@ async def get_system_logs(
     path = LOG_TARGETS[target]
     if not path.exists():
         return {"target": target, "path": str(path), "lines": []}
-    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        # Log files are usually root-owned (e.g. /var/log/nginx/*.log); the
+        # unprivileged worker cannot read them. Report it instead of failing
+        # the whole request with a 500.
+        return {
+            "target": target,
+            "path": str(path),
+            "lines": [],
+            "error": f"Log file is not readable by the panel service user: {exc.strerror or exc}",
+        }
     if search:
         content = [l for l in content if search.lower() in l.lower()]
     return {"target": target, "path": str(path), "lines": content[-lines:]}
