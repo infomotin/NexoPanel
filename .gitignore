@@ -1,0 +1,11 @@
+node_modules/
+.output/
+.nuxt/
+dist/
+*.log
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+Thumbs.db
