@@ -63,7 +63,7 @@ async def health_check() -> dict[str, str]:
 
 
 # Serve pre-built Nuxt 3 static SPA if present (single-port deployment on :8443)
-_FRONTEND_DIST = Path(__file__).resolve().parents[2].parent / "frontend" / ".output" / "public"
+_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / ".output" / "public"
 if _FRONTEND_DIST.is_dir():
     if (_FRONTEND_DIST / "_nuxt").is_dir():
         app.mount("/_nuxt", StaticFiles(directory=str(_FRONTEND_DIST / "_nuxt")), name="nuxt-assets")

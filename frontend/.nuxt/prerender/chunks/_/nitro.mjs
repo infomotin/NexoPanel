@@ -714,7 +714,7 @@ function _expandFromEnv(value) {
 const _inlineRuntimeConfig = {
   "app": {
     "baseURL": "/",
-    "buildId": "de7df5f3-5aae-427b-a335-18ae99dc0f9e",
+    "buildId": "fa2f227b-f76a-41ed-8444-32a8ddd6f3f4",
     "buildAssetsDir": "/_nuxt/",
     "cdnURL": ""
   },
@@ -742,8 +742,8 @@ const _inlineRuntimeConfig = {
     }
   },
   "public": {
-    "apiBase": "http://localhost:8443/api/v1",
-    "wsBase": "ws://localhost:8443/api/v1"
+    "apiBase": "/api/v1",
+    "wsBase": ""
   }
 };
 const envOptions = {

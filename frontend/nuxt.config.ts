@@ -6,8 +6,8 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css', '@xterm/xterm/css/xterm.css'],
   runtimeConfig: {
     public: {
-      apiBase: process.env.NUXT_PUBLIC_API_BASE || 'http://localhost:8443/api/v1',
-      wsBase: process.env.NUXT_PUBLIC_WS_BASE || 'ws://localhost:8443/api/v1'
+      apiBase: process.env.NUXT_PUBLIC_API_BASE || '/api/v1',
+      wsBase: process.env.NUXT_PUBLIC_WS_BASE || ''
     }
   },
   app: {

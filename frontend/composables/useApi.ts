@@ -36,5 +36,10 @@ export function useApi() {
     return res.json() as Promise<T>
   }
 
-  return { apiFetch, apiBase: config.public.apiBase, wsBase: config.public.wsBase }
+  const dynamicWsBase = config.public.wsBase
+    || (typeof window !== 'undefined'
+      ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/v1`
+      : 'ws://localhost:8443/api/v1')
+
+  return { apiFetch, apiBase: config.public.apiBase, wsBase: dynamicWsBase }
 }
