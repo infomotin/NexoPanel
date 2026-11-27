@@ -1,12 +1,13 @@
 """NexoPanel FastAPI Application Entrypoint."""
 from __future__ import annotations
 
+import hmac
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
@@ -55,8 +56,11 @@ async def csrf_protection_middleware(request: Request, call_next):
         if has_cookie_auth and not has_bearer and not request.url.path.endswith("/auth/login"):
             cookie_csrf = request.cookies.get(settings.CSRF_COOKIE_NAME)
             header_csrf = request.headers.get(settings.CSRF_HEADER_NAME)
-            if not cookie_csrf or not header_csrf or cookie_csrf != header_csrf:
-                raise HTTPException(status_code=403, detail="CSRF validation failed")
+            if not cookie_csrf or not header_csrf or not hmac.compare_digest(cookie_csrf, header_csrf):
+                # An HTTPException raised inside middleware bypasses FastAPI's
+                # exception handlers and surfaces as a 500, so return the 403
+                # response directly.
+                return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
     return await call_next(request)
 
 
