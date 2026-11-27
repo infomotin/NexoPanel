@@ -14,6 +14,8 @@ os.environ["NEXOPANEL_SKIP_OS_CHECK"] = "true"
 os.environ["NEXOPANEL_DAEMON_USE_MOCK_EXECUTOR"] = "true"
 os.environ["NEXOPANEL_DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["NEXOPANEL_MASTER_KEY"] = "ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+os.environ["NEXOPANEL_DNS_LIVE_CHECK_ENABLED"] = "false"
+os.environ["NEXOPANEL_UPDATE_CHECK_ENABLED"] = "false"
 
 from app.core.config import settings
 from app.db.bootstrap import seed_defaults

@@ -1,5 +1,66 @@
 <template>
   <div class="space-y-4">
+    <!-- Upstream Update Notification -->
+    <div
+      v-if="updateInfo?.update_available && !updateDismissed"
+      class="rounded-lg border border-amber-300 bg-amber-50 p-4"
+    >
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="flex items-start gap-3">
+          <div class="w-8 h-8 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+            <ArrowUpCircle class="w-5 h-5" />
+          </div>
+          <div>
+            <p class="text-sm font-bold text-amber-900">Update available for NexoPanel</p>
+            <p class="text-[11px] text-amber-800 mt-0.5">
+              Installed
+              <span class="font-mono">{{ updateInfo.current_commit_short || 'v' + updateInfo.current_version }}</span>
+              · Upstream
+              <span class="font-mono">{{ updateInfo.latest_commit_short || updateInfo.latest_version }}</span>
+              <span v-if="updateInfo.commits_behind"> · {{ updateInfo.commits_behind }} commit(s) behind</span>
+            </p>
+            <p v-if="updateInfo.latest_commit_message" class="text-[11px] text-amber-800 mt-1">
+              Latest: <span class="font-medium">{{ updateInfo.latest_commit_message }}</span>
+            </p>
+            <div v-if="updateInfo.recent_commits?.length" class="mt-2 space-y-0.5">
+              <p class="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Recent upstream commits</p>
+              <div
+                v-for="c in updateInfo.recent_commits.slice(0, 3)"
+                :key="c.sha"
+                class="flex items-center gap-2 text-[11px] text-amber-900"
+              >
+                <span class="font-mono text-[10px] bg-amber-100 rounded px-1 shrink-0">{{ c.short_sha }}</span>
+                <span class="truncate">{{ c.message }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <a :href="updateInfo.repo_url" target="_blank" rel="noopener" class="np-btn-secondary">View changes</a>
+          <button @click="dismissUpdate" class="np-btn-secondary">Dismiss</button>
+        </div>
+      </div>
+      <div class="mt-3 rounded border border-amber-200 bg-white/70 p-2.5">
+        <p class="text-[11px] font-semibold text-slate-700">How to update (run on the server as root):</p>
+        <div class="flex items-center gap-2 mt-1">
+          <code class="flex-1 text-[11px] font-mono text-slate-800 break-all">{{ updateInfo.update_command }}</code>
+          <button @click="copyUpdateCommand" class="text-emerald-700 hover:underline text-[11px] font-medium shrink-0">
+            {{ copied ? 'Copied' : 'Copy' }}
+          </button>
+        </div>
+        <p class="text-[10px] text-slate-500 mt-1">
+          Installed from a release tarball (no git checkout)? Reinstall with the one-line installer instead.
+        </p>
+      </div>
+    </div>
+    <div
+      v-else-if="updateInfo?.error && !updateDismissed"
+      class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-500 flex items-center justify-between"
+    >
+      <span>Update check unavailable: {{ updateInfo.error }}</span>
+      <button @click="loadUpdateStatus(true)" class="text-emerald-600 hover:underline font-medium">Retry</button>
+    </div>
+
     <!-- Radial Gauges Row -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
       <div v-for="gauge in gauges" :key="gauge.label" class="np-card p-4 flex items-center justify-between">
@@ -106,6 +167,7 @@
 </template>
 
 <script setup lang="ts">
+import { ArrowUpCircle } from 'lucide-vue-next'
 import { useAuthStore } from '~/stores/auth'
 
 const { apiFetch, wsBase } = useApi()
@@ -115,6 +177,9 @@ const telemetry = ref<any>(null)
 const services = ref<any[]>([])
 const auditLogs = ref<any[]>([])
 const cpuHistory = ref<number[]>([15, 22, 18, 25, 20, 30, 24, 19])
+const updateInfo = ref<any>(null)
+const updateDismissed = ref(false)
+const copied = ref(false)
 let ws: WebSocket | null = null
 
 const gauges = computed(() => {
@@ -161,7 +226,37 @@ async function controlSvc(service: string, action: string) {
   services.value = await apiFetch<any[]>('/system/services')
 }
 
+async function loadUpdateStatus(force = false) {
+  try {
+    updateInfo.value = await apiFetch<any>(`/system/updates${force ? '?force=true' : ''}`)
+    if (typeof localStorage !== 'undefined' && updateInfo.value?.latest_commit) {
+      updateDismissed.value = localStorage.getItem('np_update_dismissed') === updateInfo.value.latest_commit
+    }
+  } catch {
+    updateInfo.value = null
+  }
+}
+
+function dismissUpdate() {
+  updateDismissed.value = true
+  if (typeof localStorage !== 'undefined' && updateInfo.value?.latest_commit) {
+    localStorage.setItem('np_update_dismissed', updateInfo.value.latest_commit)
+  }
+}
+
+async function copyUpdateCommand() {
+  if (!updateInfo.value?.update_command || !navigator.clipboard) return
+  try {
+    await navigator.clipboard.writeText(updateInfo.value.update_command)
+    copied.value = true
+    setTimeout(() => (copied.value = false), 1500)
+  } catch {
+    // Clipboard permission denied; the command remains selectable in the UI.
+  }
+}
+
 onMounted(async () => {
+  loadUpdateStatus()
   await loadDashboard()
   if (auth.isAuthenticated) {
     // Cookie-authenticated socket: the JWT is never placed in the URL.

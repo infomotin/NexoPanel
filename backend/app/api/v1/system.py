@@ -26,6 +26,7 @@ from app.db.models import AuditLog, PanelSetting, User
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.services.executor import get_node_executor
+from app.services.updater import check_for_updates
 
 router = APIRouter(prefix="/system", tags=["Telemetry, Packages, Logs & Settings"])
 
@@ -82,6 +83,15 @@ def _collect_telemetry() -> dict:
 @router.get("/telemetry")
 async def get_telemetry(_: User = Depends(require_permission("telemetry:read"))) -> dict:
     return _collect_telemetry()
+
+
+@router.get("/updates")
+async def get_update_status(
+    force: bool = Query(default=False),
+    _: User = Depends(require_permission("dashboard:read")),
+) -> dict:
+    """Compare the installed panel with the upstream Git repository."""
+    return await check_for_updates(force=force)
 
 
 @router.websocket("/telemetry/ws")

@@ -288,3 +288,66 @@ async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers:
     assert update_res.status_code == 200
     assert "text/event-stream" in update_res.headers.get("content-type", "")
 
+
+
+async def test_dns_nameserver_setup_and_zone_health(client: AsyncClient, admin_headers: dict[str, str]):
+    ns = await client.get("/api/v1/dns/nameservers", headers=admin_headers)
+    assert ns.status_code == 200
+    data = ns.json()
+    for key in ("server_ip", "ns1", "ns2", "bind_status", "bind_healthy", "zone_count", "record_count"):
+        assert key in data
+
+    updated = await client.put(
+        "/api/v1/dns/nameservers",
+        headers=admin_headers,
+        json={"public_ip": "203.0.113.10", "ns1": "ns1.example.com", "ns2": "ns2.example.com"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["ns1"] == "ns1.example.com"
+
+    bad = await client.put(
+        "/api/v1/dns/nameservers",
+        headers=admin_headers,
+        json={"public_ip": "not-an-ip", "ns1": "ns1.example.com", "ns2": "ns2.example.com"},
+    )
+    assert bad.status_code == 422
+
+    zone = await client.post(
+        "/api/v1/dns/zones",
+        headers=admin_headers,
+        json={
+            "domain": "health.example.com",
+            "primary_ns": "ns1.example.com",
+            "secondary_ns": "ns2.example.com",
+        },
+    )
+    assert zone.status_code == 201
+    zone_id = zone.json()["id"]
+    zone_records = (await client.get(f"/api/v1/dns/zones/{zone_id}/records", headers=admin_headers)).json()
+    assert len([r for r in zone_records if r["record_type"] == "NS"]) == 2
+    await client.post(
+        f"/api/v1/dns/zones/{zone_id}/records",
+        headers=admin_headers,
+        json={"name": "@", "record_type": "A", "value": "203.0.113.10", "ttl": 300},
+    )
+
+    check = await client.post(f"/api/v1/dns/zones/{zone_id}/check", headers=admin_headers)
+    assert check.status_code == 200
+    result = check.json()
+    assert result["zone"] == "health.example.com"
+    assert result["overall"] in {"pass", "warn", "fail"}
+    assert {"pass", "warn", "fail"} == set(result["summary"].keys())
+    ids = {c["id"] for c in result["checks"]}
+    assert {"zone_file", "bind_service", "ns_records", "apex", "soa"} <= ids
+
+    missing = await client.post("/api/v1/dns/zones/9999/check", headers=admin_headers)
+    assert missing.status_code == 404
+
+
+async def test_update_status_endpoint(client: AsyncClient, admin_headers: dict[str, str]):
+    res = await client.get("/api/v1/system/updates", headers=admin_headers)
+    assert res.status_code == 200
+    data = res.json()
+    for key in ("enabled", "repo_url", "current_version", "update_available", "checked_at"):
+        assert key in data
+    assert data["repo_url"].endswith("NexoPanel")

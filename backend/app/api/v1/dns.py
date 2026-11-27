@@ -1,10 +1,15 @@
 """DNS Zone & Record Management API router (Bind9/PowerDNS with named-checkzone validation)."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+import ipaddress
 import json
 from pathlib import Path
+import socket
+from typing import Any
 
+import dns.resolver
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field, field_validator
@@ -12,10 +17,19 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
+from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.security import secret_manager
 from app.core.validators import validate_domain
-from app.db.models import AuditLog, DnsProviderCredential, DnsRecord, DnsZone, SslCertificate, User
+from app.db.models import (
+    AuditLog,
+    DnsProviderCredential,
+    DnsRecord,
+    DnsZone,
+    PanelSetting,
+    SslCertificate,
+    User,
+)
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.services.executor import get_node_executor
@@ -27,12 +41,23 @@ TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
 class DnsZoneCreate(BaseModel):
     domain: str
     primary_ns: str = "ns1.localhost.localdomain"
+    secondary_ns: str | None = None
     admin_email: str = "hostmaster.localhost.localdomain"
 
     @field_validator("domain")
     @classmethod
     def check_domain(cls, v: str) -> str:
         return validate_domain(v)
+
+    @field_validator("primary_ns")
+    @classmethod
+    def check_primary_ns(cls, v: str) -> str:
+        return validate_domain(v)
+
+    @field_validator("secondary_ns")
+    @classmethod
+    def check_secondary_ns(cls, v: str | None) -> str | None:
+        return validate_domain(v) if v else None
 
 
 class DnsRecordCreate(BaseModel):
@@ -55,6 +80,96 @@ class DnsProviderCreate(BaseModel):
     name: str = Field(min_length=2, max_length=64)
     provider_type: str = Field(pattern="^(cloudflare|namecheap|digitalocean|route53|dnspod|aliyun)$")
     api_token: str = Field(min_length=6)
+
+
+class NameserverUpdate(BaseModel):
+    public_ip: str
+    ns1: str
+    ns2: str
+
+    @field_validator("public_ip")
+    @classmethod
+    def check_ip(cls, v: str) -> str:
+        try:
+            return str(ipaddress.ip_address(v.strip()))
+        except ValueError as exc:
+            raise ValueError(f"Invalid IPv4/IPv6 address: {v!r}") from exc
+
+    @field_validator("ns1", "ns2")
+    @classmethod
+    def check_ns(cls, v: str) -> str:
+        return validate_domain(v)
+
+
+# --- Nameserver discovery & persistence ---------------------------------
+
+NS_SETTING_KEYS = ("dns_public_ip", "dns_ns1", "dns_ns2")
+
+
+def _detect_server_ip() -> str:
+    """Best-effort primary IP of this host (no packet is actually sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(("1.1.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.getfqdn())
+    except OSError:
+        return "127.0.0.1"
+
+
+def _default_nameservers(hostname: str) -> tuple[str, str]:
+    host = (hostname or "").strip().rstrip(".")
+    if "." in host and not host.endswith("localdomain") and not host.endswith("localhost"):
+        return f"ns1.{host}", f"ns2.{host}"
+    return "ns1.localhost.localdomain", "ns2.localhost.localdomain"
+
+
+async def _get_setting(db: AsyncSession, key: str) -> str | None:
+    row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+    return row.value if row else None
+
+
+async def _set_setting(db: AsyncSession, key: str, value: str) -> None:
+    row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+    if row:
+        row.value = value
+    else:
+        db.add(PanelSetting(key=key, value=value, is_secret=False))
+
+
+def _normalize_ns(value: str) -> str:
+    return value.strip().rstrip(".").lower()
+
+
+def _safe_resolve(qname: str, rtype: str, nameserver: str | None = None) -> dict[str, Any]:
+    """Run a single DNS lookup and never raise (used for health diagnostics)."""
+    try:
+        resolver = dns.resolver.Resolver()
+        if nameserver:
+            resolver.nameservers = [nameserver]
+        resolver.timeout = settings.DNS_CHECK_TIMEOUT_SECONDS
+        resolver.lifetime = settings.DNS_CHECK_TIMEOUT_SECONDS
+        answer = resolver.resolve(qname, rtype, raise_on_no_answer=False)
+        values = [r.to_text() for r in answer] if answer.rrset is not None else []
+        return {"ok": True, "values": values, "error": None}
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not crash the endpoint
+        return {"ok": False, "values": [], "error": str(exc)}
+
+
+async def _bind_service_status(executor) -> str:
+    try:
+        distro = get_distro_driver()
+        res = await executor.run_command(distro.build_service_control_cmd("bind9", "is-active"))
+    except Exception:  # noqa: BLE001 - diagnostics must not crash the endpoint
+        return "unknown"
+    raw = (res.stdout or "").strip()
+    if raw in {"active", "inactive", "failed", "activating", "deactivating", "unknown"}:
+        return raw
+    return "active" if res.ok else "inactive"
 
 
 async def _sync_bind_zone(zone: DnsZone, records: list[DnsRecord]) -> None:
@@ -142,9 +257,12 @@ async def create_zone(
     await db.flush()
     default_ns = DnsRecord(zone_id=zone.id, name="@", record_type="NS", value=f"{body.primary_ns}.", ttl=3600)
     db.add(default_ns)
+    if body.secondary_ns and body.secondary_ns != body.primary_ns:
+        db.add(DnsRecord(zone_id=zone.id, name="@", record_type="NS", value=f"{body.secondary_ns}.", ttl=3600))
     await db.flush()
 
-    await _sync_bind_zone(zone, [default_ns])
+    zone_records = (await db.execute(select(DnsRecord).where(DnsRecord.zone_id == zone.id))).scalars().all()
+    await _sync_bind_zone(zone, list(zone_records))
     await record_audit_event(
         db, actor=actor, request=request, permission="dns:write", action="create_dns_zone", target_resource=f"dns:{zone.domain}"
     )
@@ -428,3 +546,292 @@ async def delete_provider(
     )
     await db.commit()
     return {"deleted": True}
+
+
+# --- Nameserver setup & live DNS diagnostics ----------------------------
+
+
+@router.get("/nameservers")
+async def get_nameservers(
+    _: User = Depends(require_permission("dns:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the nameservers this panel advertises plus authoritative-engine status.
+
+    The values are persisted in ``panel_settings`` so the operator can publish
+    the exact hostnames registered as glue records at their domain registrar.
+    """
+    hostname = socket.getfqdn() or socket.gethostname()
+    default_ns1, default_ns2 = _default_nameservers(hostname)
+
+    stored_ip = await _get_setting(db, "dns_public_ip")
+    stored_ns1 = await _get_setting(db, "dns_ns1")
+    stored_ns2 = await _get_setting(db, "dns_ns2")
+
+    # When the host has no FQDN, suggest nameservers under the first managed
+    # domain (e.g. ns1.example.com) instead of a useless localhost placeholder.
+    first_zone = (await db.execute(select(DnsZone.domain).order_by(DnsZone.id).limit(1))).scalar_one_or_none()
+    if first_zone and default_ns1.endswith("localhost.localdomain"):
+        default_ns1, default_ns2 = f"ns1.{first_zone}", f"ns2.{first_zone}"
+
+    executor = get_node_executor()
+    bind_status = await _bind_service_status(executor)
+
+    zone_count = (await db.execute(select(func.count(DnsZone.id)))).scalar_one()
+    record_count = (await db.execute(select(func.count(DnsRecord.id)))).scalar_one()
+
+    return {
+        "hostname": hostname,
+        "server_ip": stored_ip or _detect_server_ip(),
+        "ns1": stored_ns1 or default_ns1,
+        "ns2": stored_ns2 or default_ns2,
+        "customized": any([stored_ip, stored_ns1, stored_ns2]),
+        "bind_status": bind_status,
+        "bind_healthy": bind_status in {"active", "activating"},
+        "zone_count": zone_count,
+        "record_count": record_count,
+        "live_check_enabled": settings.DNS_LIVE_CHECK_ENABLED,
+    }
+
+
+@router.put("/nameservers")
+async def update_nameservers(
+    body: NameserverUpdate,
+    request: Request,
+    actor: User = Depends(require_permission("dns:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await _set_setting(db, "dns_public_ip", body.public_ip)
+    await _set_setting(db, "dns_ns1", body.ns1)
+    await _set_setting(db, "dns_ns2", body.ns2)
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="dns:write",
+        action="update_nameservers",
+        target_resource="dns:nameservers",
+        after_state={"public_ip": body.public_ip, "ns1": body.ns1, "ns2": body.ns2},
+    )
+    await db.commit()
+    return {"ok": True, "public_ip": body.public_ip, "ns1": body.ns1, "ns2": body.ns2}
+
+
+def _check(check_id: str, label: str, status: str, detail: str, fix: str | None = None) -> dict:
+    return {"id": check_id, "label": label, "status": status, "detail": detail, "fix": fix}
+
+
+@router.post("/zones/{zone_id}/check")
+async def check_zone(
+    zone_id: int,
+    _: User = Depends(require_permission("dns:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Run end-to-end DNS diagnostics for a zone and return actionable fixes."""
+    zone = (await db.execute(select(DnsZone).where(DnsZone.id == zone_id))).scalar_one_or_none()
+    if not zone:
+        raise HTTPException(status_code=404, detail="DNS zone not found")
+
+    records = (await db.execute(select(DnsRecord).where(DnsRecord.zone_id == zone.id))).scalars().all()
+    executor = get_node_executor(zone.node_id)
+    distro = get_distro_driver()
+    checks: list[dict] = []
+
+    # 1. Zone file syntax (named-checkzone)
+    zone_file = f"{distro.paths.bind_zones_dir}/db.{zone.domain}"
+    try:
+        check_res = await executor.run_command([distro.paths.bind_checkzone_bin, zone.domain, zone_file])
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not crash the endpoint
+        check_res = None
+        check_error = str(exc)
+    else:
+        check_error = None
+    if check_res is not None and check_res.ok:
+        checks.append(_check("zone_file", "Zone file syntax", "pass", f"{zone_file} passes named-checkzone validation."))
+    else:
+        detail = check_error or (
+            (check_res.stderr or check_res.stdout).strip() if check_res else "named-checkzone is unavailable"
+        )
+        checks.append(
+            _check(
+                "zone_file",
+                "Zone file syntax",
+                "fail",
+                detail or "named-checkzone rejected the zone file",
+                "Correct the record values shown above, then click 'Pull Data' to regenerate the zone file and reload BIND9.",
+            )
+        )
+
+    # 2. Authoritative engine status
+    bind_status = await _bind_service_status(executor)
+    if bind_status in {"active", "activating"}:
+        checks.append(_check("bind_service", "BIND9 authoritative service", "pass", f"named service is {bind_status}."))
+    else:
+        checks.append(
+            _check(
+                "bind_service",
+                "BIND9 authoritative service",
+                "fail",
+                f"named service is {bind_status}.",
+                "Start BIND9 (systemctl start named) and confirm it is enabled (systemctl enable named), then re-run the test.",
+            )
+        )
+
+    # 3. Nameserver records in the zone
+    ns_values = [_normalize_ns(r.value) for r in records if r.record_type == "NS"]
+    if len(ns_values) >= 2:
+        checks.append(_check("ns_records", "NS records", "pass", f"Zone publishes {len(ns_values)} nameserver(s): {', '.join(ns_values)}."))
+    elif len(ns_values) == 1:
+        checks.append(
+            _check(
+                "ns_records",
+                "NS records",
+                "warn",
+                f"Only one NS record is configured ({ns_values[0]}).",
+                "Add a second NS record (for example ns2) for redundancy; registrars require at least two nameservers.",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "ns_records",
+                "NS records",
+                "fail",
+                "The zone has no NS records.",
+                "Add an NS record with host '@' pointing to your nameserver hostname (for example ns1.example.com).",
+            )
+        )
+
+    # 4. Apex address record
+    apex = [r for r in records if r.name in {"@", ""} and r.record_type in {"A", "AAAA"}]
+    if apex:
+        checks.append(_check("apex", "Apex address record", "pass", f"Apex resolves to {', '.join(r.value for r in apex)}."))
+    else:
+        checks.append(
+            _check(
+                "apex",
+                "Apex address record",
+                "warn",
+                "No A/AAAA record exists at the zone apex (@).",
+                "Add an A record with host '@' pointing to your server IP so the bare domain resolves.",
+            )
+        )
+
+    # 5. SOA / serial sanity
+    if zone.serial > 0:
+        checks.append(_check("soa", "SOA serial", "pass", f"Zone serial is {zone.serial}."))
+    else:
+        checks.append(
+            _check("soa", "SOA serial", "fail", "Zone serial is not initialised.", "Click 'Pull Data' to regenerate the SOA record.")
+        )
+
+    # 6-8. Live resolution checks (authoritative + public delegation)
+    if settings.DNS_LIVE_CHECK_ENABLED:
+        local_ns = await asyncio.to_thread(_safe_resolve, zone.domain, "NS", "127.0.0.1")
+        if not local_ns["ok"]:
+            checks.append(
+                _check(
+                    "local_resolution",
+                    "Local authoritative resolution",
+                    "warn",
+                    f"Could not query BIND9 on 127.0.0.1:53 ({local_ns['error']}).",
+                    "Confirm BIND9 listens on port 53 and that the zone is included from named.conf.local, then reload named.",
+                )
+            )
+        elif not local_ns["values"]:
+            checks.append(
+                _check(
+                    "local_resolution",
+                    "Local authoritative resolution",
+                    "warn",
+                    "BIND9 answered but returned no NS records for the zone.",
+                    "Check that the zone file contains NS records and that the zone is loaded (named-checkzone + reload).",
+                )
+            )
+        else:
+            checks.append(
+                _check("local_resolution", "Local authoritative resolution", "pass", f"BIND9 answered NS: {', '.join(local_ns['values'])}.")
+            )
+
+        public_ns = await asyncio.to_thread(_safe_resolve, zone.domain, "NS")
+        if not public_ns["ok"]:
+            checks.append(
+                _check(
+                    "public_delegation",
+                    "Public delegation",
+                    "warn",
+                    f"Public NS lookup failed ({public_ns['error']}).",
+                    "Set the domain's nameservers at your registrar to the NS1/NS2 hostnames shown in the Nameserver tab, then wait for propagation.",
+                )
+            )
+        elif not public_ns["values"]:
+            checks.append(
+                _check(
+                    "public_delegation",
+                    "Public delegation",
+                    "warn",
+                    "No public NS records were returned for the domain.",
+                    "Register the domain's nameservers (NS1/NS2) at your registrar and create matching glue/A records.",
+                )
+            )
+        else:
+            observed = {_normalize_ns(v) for v in public_ns["values"]}
+            expected = set(ns_values)
+            if expected and observed == expected:
+                checks.append(
+                    _check("public_delegation", "Public delegation", "pass", f"Registrar delegation matches: {', '.join(sorted(observed))}.")
+                )
+            else:
+                checks.append(
+                    _check(
+                        "public_delegation",
+                        "Public delegation",
+                        "warn",
+                        f"Public NS is {', '.join(sorted(observed))} but the zone publishes {', '.join(sorted(expected)) or 'none'}.",
+                        "Update the nameservers at your registrar to match the zone NS records, or add the delegated nameservers as NS records.",
+                    )
+                )
+
+        apex_a = next((r for r in apex if r.record_type == "A"), None)
+        if apex_a:
+            public_a = await asyncio.to_thread(_safe_resolve, zone.domain, "A")
+            if public_a["ok"] and public_a["values"]:
+                if apex_a.value in public_a["values"]:
+                    checks.append(_check("propagation", "Public propagation", "pass", f"{zone.domain} resolves to {apex_a.value}."))
+                else:
+                    checks.append(
+                        _check(
+                            "propagation",
+                            "Public propagation",
+                            "warn",
+                            f"{zone.domain} resolves to {', '.join(public_a['values'])} but the zone expects {apex_a.value}.",
+                            "Allow up to the record TTL for propagation, or correct the A record and pull the zone again.",
+                        )
+                    )
+            else:
+                checks.append(
+                    _check(
+                        "propagation",
+                        "Public propagation",
+                        "warn",
+                        f"{zone.domain} did not resolve publicly ({public_a['error'] or 'no answer'}).",
+                        "Ensure the domain is delegated to this server and the apex A record points to the server's public IP.",
+                    )
+                )
+    else:
+        checks.append(_check("live_checks", "Live resolution checks", "info", "Live lookups are disabled in this environment."))
+
+    summary = {
+        "pass": sum(1 for c in checks if c["status"] == "pass"),
+        "warn": sum(1 for c in checks if c["status"] == "warn"),
+        "fail": sum(1 for c in checks if c["status"] == "fail"),
+    }
+    overall = "fail" if summary["fail"] else ("warn" if summary["warn"] else "pass")
+
+    return {
+        "zone": zone.domain,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "overall": overall,
+        "summary": summary,
+        "checks": checks,
+    }

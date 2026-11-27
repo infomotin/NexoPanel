@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     # Terminal
     TERMINAL_IDLE_TIMEOUT_SECONDS: int = 900
 
+    # DNS diagnostics (live resolution checks may be disabled on offline hosts)
+    DNS_LIVE_CHECK_ENABLED: bool = True
+    DNS_CHECK_TIMEOUT_SECONDS: float = 3.0
+
+    # Update checks against the upstream Git repository
+    UPDATE_CHECK_ENABLED: bool = True
+    UPDATE_CHECK_TTL_SECONDS: int = 120
+    GITHUB_REPO: str = "infomotin/NexoPanel"
+    GITHUB_TOKEN: str | None = None
+
     @property
     def resolved_database_url(self) -> str:
         if self.DATABASE_URL:
