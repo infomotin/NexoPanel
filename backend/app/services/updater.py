@@ -18,9 +18,7 @@ import httpx
 
 from app.core.config import settings
 
-_UPDATE_COMMAND = (
-    "cd /opt/nexopanel && git pull --ff-only origin main && sudo bash scripts/install.sh"
-)
+_UPDATE_COMMAND = "sudo bash /opt/nexopanel/scripts/update.sh"
 _REINSTALL_COMMAND = (
     "curl -fsSL https://raw.githubusercontent.com/infomotin/NexoPanel/main/scripts/install.sh "
     "| sudo bash -s -- --repo https://github.com/infomotin/NexoPanel.git"

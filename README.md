@@ -77,3 +77,13 @@ scp dist/nexopanel-1.0.0-linux.tar.gz root@your-server:/root/
 # On target server:
 tar -xzf nexopanel-1.0.0-linux.tar.gz && cd nexopanel-1.0.0 && sudo bash scripts/install.sh
 ```
+
+### Updating an existing installation
+
+The checkout under `/opt/nexopanel` is owned by `root` while the panel service runs as the unprivileged `nexopanel` user, so a plain `git pull` from that account fails with *"detected dubious ownership"*. Update as root instead:
+
+```bash
+sudo bash /opt/nexopanel/scripts/update.sh
+```
+
+This fast-forwards `main`, rebuilds the Nuxt bundle and restarts `nexopanel`/`nexopanel-daemon`. The dashboard also shows an update banner (with recent upstream commits) whenever the installed commit differs from the GitHub `main` branch.

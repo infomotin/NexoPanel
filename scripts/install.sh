@@ -121,14 +121,20 @@ cd "$NEXOPANEL_HOME" || cd /tmp
 if [[ -n "$GIT_REPO" ]]; then
   log "Cloning/updating NexoPanel from Git repository: ${GIT_REPO} (${GIT_BRANCH})..."
   if [[ -d "${NEXOPANEL_HOME}/.git" ]]; then
-    git -C "$NEXOPANEL_HOME" fetch --all --prune
-    git -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
-    git -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" fetch --all --prune
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
   else
     rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
     git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
   fi
   REBUILD_FRONTEND=1
+elif [[ "$REPO_ROOT" == "$NEXOPANEL_HOME" ]]; then
+  # Running the installer from the installed checkout itself (e.g. after a
+  # `git pull`). Copying the tree onto itself would delete backend/ before it
+  # could be read, so use the in-place sources and just rebuild the frontend.
+  log "Using in-place sources from ${NEXOPANEL_HOME}..."
+  [[ -d "${NEXOPANEL_HOME}/.git" ]] && REBUILD_FRONTEND=1
 elif [[ -d "${REPO_ROOT}/backend" ]]; then
   log "Installing/updating NexoPanel from local source (${REPO_ROOT})..."
   rm -rf "${NEXOPANEL_HOME}/backend"
