@@ -7,6 +7,7 @@ import os
 import platform
 import socket
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,33 @@ class PackageActionRequest(BaseModel):
 
 class SettingUpdateRequest(BaseModel):
     value: str
+
+
+class SettingsBatchUpdateRequest(BaseModel):
+    settings: dict[str, str]
+
+
+class TestSmtpRequest(BaseModel):
+    smtp_host: str = Field(min_length=1)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_encryption: str = Field(default="tls")
+    smtp_user: str = Field(default="")
+    smtp_password: str = Field(default="")
+    smtp_from_email: str = Field(default="")
+    test_recipient: str = Field(default="")
+
+
+class TestS3Request(BaseModel):
+    s3_endpoint: str = Field(default="")
+    s3_bucket: str = Field(min_length=1)
+    s3_region: str = Field(default="us-east-1")
+    s3_access_key: str = Field(min_length=1)
+    s3_secret_key: str = Field(min_length=1)
+
+
+class RestartServiceRequest(BaseModel):
+    service: str = Field(pattern="^[a-zA-Z0-9_-]{1,64}$")
+    action: str = Field(default="restart", pattern="^(restart|reload|start|stop)$")
 
 
 def _collect_telemetry() -> dict:
@@ -778,15 +806,136 @@ async def get_audit_logs(
     ]
 
 
-# --- Panel Settings ---
+# --- Panel Settings & System Maintenance ---
+
+DEFAULT_PANEL_SETTINGS: dict[str, str] = {
+    # 1. General Branding & Localization
+    "panel_title": "NexoPanel",
+    "panel_url": "http://129.121.128.122:8443",
+    "admin_email": "admin@localhost.localdomain",
+    "timezone": "UTC",
+    "language": "en",
+    "date_format": "YYYY-MM-DD HH:mm:ss",
+
+    # 2. Security & Session Hardening
+    "session_timeout_minutes": "10080",
+    "force_https": "false",
+    "rate_limit_login": "true",
+    "max_login_attempts": "5",
+    "lockout_duration_minutes": "15",
+    "ip_allowlist": "",
+    "hsts_enabled": "true",
+    "security_headers": "true",
+
+    # 3. Panel Web Port & SSL
+    "panel_port": "8443",
+    "panel_domain": "",
+    "panel_ssl_type": "self_signed",
+
+    # 4. Outgoing SMTP Mail Server
+    "smtp_enabled": "false",
+    "smtp_host": "",
+    "smtp_port": "587",
+    "smtp_encryption": "tls",
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_from_email": "noreply@localhost",
+    "smtp_from_name": "NexoPanel Alerts",
+
+    # 5. Web & Runtime Defaults
+    "default_php_version": "8.3",
+    "default_web_root": "/var/www/{domain}/public",
+    "auto_ssl_enabled": "true",
+    "nginx_client_max_body_size": "128M",
+    "default_database_prefix": "db_",
+
+    # 6. Automated Backup & Storage
+    "backup_retention_days": "14",
+    "backup_storage_provider": "local",
+    "s3_endpoint": "",
+    "s3_bucket": "",
+    "s3_region": "us-east-1",
+    "s3_access_key": "",
+    "s3_secret_key": "",
+
+    # 7. System Maintenance
+    "auto_update_check": "true",
+    "maintenance_mode": "false",
+    "maintenance_message": "System is undergoing scheduled maintenance. Please check back shortly.",
+}
+
+SECRET_KEYS = {"smtp_password", "s3_secret_key"}
+
 
 @router.get("/settings")
 async def list_settings(
     _: User = Depends(require_permission("settings:read")),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
+    """Retrieve full list of panel configuration settings with defaults merged."""
     rows = (await db.execute(select(PanelSetting))).scalars().all()
-    return [{"key": r.key, "value": "********" if r.is_secret else r.value, "is_secret": r.is_secret} for r in rows]
+    saved_map = {r.key: r for r in rows}
+
+    results: list[dict] = []
+    # Include all saved rows
+    for r in rows:
+        val = "********" if (r.is_secret and r.value) else r.value
+        results.append({"key": r.key, "value": val, "is_secret": r.is_secret})
+
+    # Include any default settings not yet persisted in database
+    for k, v in DEFAULT_PANEL_SETTINGS.items():
+        if k not in saved_map:
+            is_sec = k in SECRET_KEYS
+            results.append({"key": k, "value": "********" if is_sec and v else v, "is_secret": is_sec})
+
+    return results
+
+
+@router.get("/settings/map")
+async def get_settings_map(
+    _: User = Depends(require_permission("settings:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieve all panel settings as a key-value dictionary with defaults merged."""
+    rows = (await db.execute(select(PanelSetting))).scalars().all()
+    out = dict(DEFAULT_PANEL_SETTINGS)
+    for r in rows:
+        if r.is_secret and r.value:
+            out[r.key] = "********"
+        else:
+            out[r.key] = r.value
+    return out
+
+
+@router.post("/settings/batch")
+async def update_settings_batch(
+    body: SettingsBatchUpdateRequest,
+    request: Request,
+    actor: User = Depends(require_permission("settings:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Batch update multiple panel configuration settings in a single atomic transaction."""
+    updated_count = 0
+    for key, val in body.settings.items():
+        # Do not overwrite secret passwords with masked placeholder
+        if key in SECRET_KEYS and val == "********":
+            continue
+
+        row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+        is_sec = key in SECRET_KEYS
+        if not row:
+            row = PanelSetting(key=key, value=val, is_secret=is_sec)
+            db.add(row)
+        else:
+            row.value = val
+            row.is_secret = is_sec
+        updated_count += 1
+
+    await record_audit_event(
+        db, actor=actor, request=request, permission="settings:write", action="update_settings_batch", target_resource="settings"
+    )
+    await db.commit()
+    return {"ok": True, "updated_count": updated_count}
 
 
 @router.put("/settings/{key}")
@@ -797,14 +946,229 @@ async def update_setting(
     actor: User = Depends(require_permission("settings:write")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Update a single panel setting."""
+    if key in SECRET_KEYS and body.value == "********":
+        return {"key": key, "updated": False, "note": "Secret masked value ignored"}
+
     row = (await db.execute(select(PanelSetting).where(PanelSetting.key == key))).scalar_one_or_none()
+    is_sec = key in SECRET_KEYS
     if not row:
-        row = PanelSetting(key=key, value=body.value, is_secret=False)
+        row = PanelSetting(key=key, value=body.value, is_secret=is_sec)
         db.add(row)
     else:
         row.value = body.value
+        row.is_secret = is_sec
     await record_audit_event(
         db, actor=actor, request=request, permission="settings:write", action="update_setting", target_resource=f"setting:{key}"
     )
     await db.commit()
     return {"key": key, "updated": True}
+
+
+@router.post("/settings/test-smtp")
+async def test_smtp(
+    body: TestSmtpRequest,
+    _: User = Depends(require_permission("settings:write")),
+) -> dict[str, Any]:
+    """Test connection and authentication to remote SMTP mail server."""
+    executor = get_node_executor()
+    if getattr(executor, "use_mock", False):
+        return {"ok": True, "message": f"SMTP connection to {body.smtp_host}:{body.smtp_port} successful (mock)."}
+
+    try:
+        import smtplib
+        import ssl
+
+        if body.smtp_encryption == "ssl":
+            ctx = ssl.create_default_context()
+            server = smtplib.SMTP_SSL(body.smtp_host, body.smtp_port, context=ctx, timeout=10)
+        else:
+            server = smtplib.SMTP(body.smtp_host, body.smtp_port, timeout=10)
+            if body.smtp_encryption == "tls":
+                server.starttls()
+
+        if body.smtp_user and body.smtp_password and body.smtp_password != "********":
+            server.login(body.smtp_user, body.smtp_password)
+
+        server.quit()
+        return {"ok": True, "message": f"Successfully connected to SMTP server at {body.smtp_host}:{body.smtp_port}."}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@router.post("/settings/test-s3")
+async def test_s3(
+    body: TestS3Request,
+    _: User = Depends(require_permission("settings:write")),
+) -> dict[str, Any]:
+    """Test DNS resolution and basic reachability of S3 endpoint or bucket."""
+    executor = get_node_executor()
+    if getattr(executor, "use_mock", False):
+        return {"ok": True, "message": f"Connected to S3 bucket '{body.s3_bucket}' successfully (mock)."}
+
+    if body.s3_endpoint:
+        from urllib.parse import urlparse
+        host = urlparse(body.s3_endpoint).hostname or body.s3_endpoint
+    else:
+        host = f"{body.s3_bucket}.s3.{body.s3_region}.amazonaws.com"
+
+    try:
+        socket.gethostbyname(host)
+        return {"ok": True, "message": f"S3 endpoint '{host}' resolved successfully."}
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to reach S3 endpoint: {exc}"}
+
+
+@router.post("/settings/clean-cache")
+async def clean_system_cache(
+    request: Request,
+    actor: User = Depends(require_permission("settings:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Clean panel temporary working directories, package manager cache, and transient files."""
+    executor = get_node_executor()
+    cleaned_items: list[str] = []
+
+    # Clean panel temp staging dir
+    tmp_path = Path("/run/nexopanel/tmp")
+    if tmp_path.exists():
+        import shutil
+        for f in tmp_path.iterdir():
+            try:
+                if f.is_file() or f.is_symlink():
+                    f.unlink()
+                elif f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+                cleaned_items.append(f.name)
+            except Exception:
+                pass
+
+    # Run apt-get clean if available
+    await executor.run_command(["/usr/bin/apt-get", "clean"])
+
+    await record_audit_event(
+        db, actor=actor, request=request, permission="settings:write", action="clean_cache", target_resource="system"
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "message": "Temporary files, package manager cache, and session buffers cleaned.",
+        "cleaned_count": len(cleaned_items),
+    }
+
+
+@router.get("/settings/export")
+async def export_settings(
+    _: User = Depends(require_permission("settings:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Export non-secret panel configuration settings as a portable JSON payload."""
+    rows = (await db.execute(select(PanelSetting))).scalars().all()
+    export_dict = {}
+    for r in rows:
+        if not r.is_secret:
+            export_dict[r.key] = r.value
+    # Also include any defaults not explicitly in DB
+    for k, v in DEFAULT_PANEL_SETTINGS.items():
+        if k not in export_dict and k not in SECRET_KEYS:
+            export_dict[k] = v
+
+    return {
+        "version": "1.0",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "settings": export_dict,
+    }
+
+
+@router.post("/settings/import")
+async def import_settings(
+    body: dict[str, Any],
+    request: Request,
+    actor: User = Depends(require_permission("settings:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Import and apply panel configuration settings from JSON payload."""
+    imported_settings = body.get("settings", {})
+    if not isinstance(imported_settings, dict):
+        raise HTTPException(status_code=400, detail="Invalid settings payload. Expected an object with a 'settings' dictionary.")
+
+    count = 0
+    for k, v in imported_settings.items():
+        if not isinstance(v, str):
+            continue
+        is_sec = k in SECRET_KEYS
+        row = (await db.execute(select(PanelSetting).where(PanelSetting.key == k))).scalar_one_or_none()
+        if not row:
+            db.add(PanelSetting(key=k, value=v, is_secret=is_sec))
+        else:
+            row.value = v
+            row.is_secret = is_sec
+        count += 1
+
+    await record_audit_event(
+        db, actor=actor, request=request, permission="settings:write", action="import_settings", target_resource="settings"
+    )
+    await db.commit()
+    return {"ok": True, "imported_count": count}
+
+
+@router.post("/settings/reset-defaults")
+async def reset_settings_defaults(
+    request: Request,
+    actor: User = Depends(require_permission("settings:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Reset panel configuration settings to factory defaults."""
+    for k, v in DEFAULT_PANEL_SETTINGS.items():
+        is_sec = k in SECRET_KEYS
+        row = (await db.execute(select(PanelSetting).where(PanelSetting.key == k))).scalar_one_or_none()
+        if not row:
+            db.add(PanelSetting(key=k, value=v, is_secret=is_sec))
+        else:
+            row.value = v
+            row.is_secret = is_sec
+
+    await record_audit_event(
+        db, actor=actor, request=request, permission="settings:write", action="reset_settings_defaults", target_resource="settings"
+    )
+    await db.commit()
+    return {"ok": True, "message": "Settings restored to factory defaults."}
+
+
+@router.post("/maintenance/restart-service")
+async def restart_system_service(
+    body: RestartServiceRequest,
+    request: Request,
+    actor: User = Depends(require_permission("settings:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Restart or reload key system and web services."""
+    allowed_services = {
+        "nexopanel",
+        "nginx",
+        "mariadb",
+        "postgresql",
+        "redis-server",
+        "fail2ban",
+        "postfix",
+        "dovecot",
+        "docker",
+    }
+    if body.service not in allowed_services:
+        raise HTTPException(status_code=400, detail=f"Service not allowed. Choose from {sorted(list(allowed_services))}")
+
+    executor = get_node_executor()
+    distro = get_distro_driver()
+    cmd = distro.build_service_control_cmd(body.service, body.action)
+    res = await executor.run_command(cmd)
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="settings:write",
+        action=f"maintenance_{body.action}_{body.service}",
+        target_resource=body.service,
+    )
+    await db.commit()
+    return {"ok": res.ok, "service": body.service, "action": body.action, "stdout": res.stdout, "stderr": res.stderr}

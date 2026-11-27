@@ -118,7 +118,7 @@ SYSTEMCTL_ACTIONS = {
     "reopenlogs",
 }
 
-APT_ACTIONS = {"update", "install", "remove", "purge", "upgrade", "--only-upgrade"}
+APT_ACTIONS = {"update", "install", "remove", "purge", "upgrade", "--only-upgrade", "clean", "autoremove"}
 APT_FLAGS = {"-y", "-q", "-qq", "--only-upgrade", "--allow-downgrades", "--allow-remove-essential"}
 
 NGINX_SIGNALS = {"reload", "reopen"}
