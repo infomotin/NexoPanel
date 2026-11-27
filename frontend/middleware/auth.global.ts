@@ -20,20 +20,23 @@ export default defineNuxtRouteMiddleware(async (to) => {
     return
   }
 
-  if (!auth.isAuthenticated) {
-    try {
-      const res = await fetch(`${config.public.apiBase}/auth/me`, {
-        credentials: 'same-origin',
-        headers: auth.token ? { Authorization: `Bearer ${auth.token}` } : {},
-      })
-      if (res.ok) {
-        const data = (await res.json()) as (PanelUser & { access_token?: string })
-        auth.setUser(data, data.access_token)
-      } else {
-        auth.clearSession()
-      }
-    } catch {
+  // Always refresh and validate session against backend
+  try {
+    const res = await fetch(`${config.public.apiBase}/auth/me`, {
+      credentials: 'same-origin',
+      headers: auth.token ? { Authorization: `Bearer ${auth.token}` } : {},
+    })
+    if (res.ok) {
+      const data = (await res.json()) as (PanelUser & { access_token?: string })
+      auth.setUser(data, data.access_token)
+    } else if (res.status === 401) {
       auth.clearSession()
+      return '/login'
+    }
+  } catch {
+    if (!auth.isAuthenticated) {
+      auth.clearSession()
+      return '/login'
     }
   }
 
