@@ -8,18 +8,23 @@ import uuid
 import zipfile
 from pathlib import Path
 
+try:
+    import pwd
+except ImportError:
+    pwd = None  # Windows dev fallback
+
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
 from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.validators import canonicalize_safe_path
-from app.db.models import FileTrashItem, User
+from app.db.models import AuditLog, FileTrashItem, User
 from app.db.session import get_db
 
 router = APIRouter(prefix="/files", tags=["Web File Manager"])
@@ -79,6 +84,11 @@ async def list_directory(
     entries = []
     for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
         st = item.stat()
+        try:
+            owner = pwd.getpwuid(st.st_uid).pw_name if pwd else str(st.st_uid)
+        except Exception:
+            owner = str(st.st_uid)
+        mode_octal = oct(st.st_mode & 0o777).replace("0o", "").zfill(3)
         entries.append(
             {
                 "name": item.name,
@@ -86,6 +96,8 @@ async def list_directory(
                 "is_dir": item.is_dir(),
                 "size": st.st_size,
                 "mode": oct(st.st_mode & 0o777),
+                "mode_short": mode_octal,
+                "owner": owner,
                 "modified_at": st.st_mtime,
             }
         )
@@ -422,3 +434,114 @@ async def restore_from_trash(
     )
     await db.commit()
     return {"restored": True, "path": str(dest)}
+
+
+@router.get("/size")
+async def calculate_size(
+    path: str = Query(...),
+    _: User = Depends(require_permission("files:read")),
+) -> dict:
+    target = _safe_path(path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    if target.is_file():
+        return {"path": str(target), "size": target.stat().st_size}
+    total = 0
+    for p in target.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return {"path": str(target), "size": total}
+
+
+@router.get("/search-content")
+async def search_file_content(
+    path: str = Query(default="/var/www"),
+    query: str = Query(..., min_length=1),
+    _: User = Depends(require_permission("files:read")),
+) -> dict:
+    root = _safe_path(path)
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail="Search root must be a directory")
+    matches = []
+    q_lower = query.lower()
+    for p in root.rglob("*"):
+        if not p.is_file() or p.stat().st_size > 2 * 1024 * 1024:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            for idx, line in enumerate(text.splitlines(), start=1):
+                if q_lower in line.lower():
+                    matches.append({"path": str(p), "name": p.name, "line": idx, "snippet": line.strip()[:160]})
+                    break
+        except OSError:
+            continue
+        if len(matches) >= 50:
+            break
+    return {"matches": matches}
+
+
+@router.delete("/trash/{item_id}")
+async def delete_trash_item(
+    item_id: int,
+    _: User = Depends(require_permission("files:delete")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    item = (await db.execute(select(FileTrashItem).where(FileTrashItem.id == item_id))).scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Trash item not found")
+    tp = Path(item.trash_path)
+    if tp.exists():
+        if tp.is_dir():
+            shutil.rmtree(tp)
+        else:
+            tp.unlink()
+    await db.delete(item)
+    await db.commit()
+    return {"deleted": True}
+
+
+@router.delete("/trash")
+async def empty_trash(
+    _: User = Depends(require_permission("files:delete")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    items = (await db.execute(select(FileTrashItem))).scalars().all()
+    for item in items:
+        tp = Path(item.trash_path)
+        if tp.exists():
+            if tp.is_dir():
+                shutil.rmtree(tp)
+            else:
+                tp.unlink()
+        await db.delete(item)
+    await db.commit()
+    return {"emptied": True}
+
+
+@router.get("/logs")
+async def get_file_logs(
+    _: User = Depends(require_permission("files:read")),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    logs = (
+        await db.execute(
+            select(AuditLog)
+            .where(or_(AuditLog.permission.like("files:%"), AuditLog.action.in_(["write_file", "upload_file", "mkdir", "move_file", "copy_file", "chmod", "archive_files", "extract_archive", "delete_file", "fetch_url", "trash_file", "restore_trash"])))
+            .order_by(AuditLog.id.desc())
+            .limit(100)
+        )
+    ).scalars().all()
+    return [
+        {
+            "id": l.id,
+            "actor": l.actor_username,
+            "action": l.action,
+            "target": l.target_resource,
+            "status": l.status,
+            "created_at": l.created_at.isoformat(),
+        }
+        for l in logs
+    ]
