@@ -163,8 +163,9 @@ async function controlSvc(service: string, action: string) {
 
 onMounted(async () => {
   await loadDashboard()
-  if (auth.token) {
-    ws = new WebSocket(`${wsBase}/system/telemetry/ws?token=${encodeURIComponent(auth.token)}`)
+  if (auth.isAuthenticated) {
+    // Cookie-authenticated socket: the JWT is never placed in the URL.
+    ws = new WebSocket(`${wsBase}/system/telemetry/ws`)
     ws.onmessage = (evt) => {
       const data = JSON.parse(evt.data)
       telemetry.value = data

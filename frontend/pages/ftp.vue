@@ -342,7 +342,12 @@ function notify(msg: string, ok = true) {
 }
 function genPass(len = 14) {
   const chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%'
-  return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+  // CSPRNG: Math.random() is not cryptographically strong and must not mint
+  // account credentials.
+  const rnd = new Uint32Array(len)
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(rnd)
+  else for (let i = 0; i < len; i++) rnd[i] = Math.floor(Math.random() * 0xffffffff)
+  return Array.from({ length: len }, (_, i) => chars[rnd[i] % chars.length]).join('')
 }
 function copyText(text: string, key: string) {
   navigator.clipboard?.writeText(text)

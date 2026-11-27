@@ -1,13 +1,23 @@
+// The bearer token is kept in memory only. Persisting it in localStorage would
+// expose a full-privilege session token to any XSS payload (and to any other
+// script running on the page) for the lifetime of the browser profile.
+let authToken: string | null = null;
+
+// Purge any token persisted by an older build so it cannot be replayed.
+if (typeof localStorage !== 'undefined') {
+  localStorage.removeItem('np_express_token');
+}
+
 export function getToken(): string | null {
-  return localStorage.getItem('np_express_token');
+  return authToken;
 }
 
 export function setToken(token: string) {
-  localStorage.setItem('np_express_token', token);
+  authToken = token;
 }
 
 export function clearToken() {
-  localStorage.removeItem('np_express_token');
+  authToken = null;
 }
 
 export async function apiFetch<T = any>(path: string, options: RequestInit = {}): Promise<T> {

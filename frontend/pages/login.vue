@@ -49,7 +49,8 @@ definePageMeta({ layout: false })
 const { apiFetch } = useApi()
 const auth = useAuthStore()
 
-const username = ref('admin')
+// Do not pre-fill a username: it advertises a valid account name on the login form.
+const username = ref('')
 const password = ref('')
 const totpCode = ref('')
 const partialToken = ref('')

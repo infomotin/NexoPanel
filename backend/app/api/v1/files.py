@@ -16,14 +16,14 @@ except ImportError:
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
 from app.core.config import settings
 from app.core.rbac import require_permission
-from app.core.validators import canonicalize_safe_path
+from app.core.validators import canonicalize_safe_path, validate_outbound_url
 from app.db.models import AuditLog, FileTrashItem, User
 from app.db.session import get_db
 
@@ -324,9 +324,18 @@ async def delete_item(
 
 
 class FetchUrlRequest(BaseModel):
-    url: str
+    url: str = Field(min_length=8, max_length=2048)
     destination_dir: str
     filename: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def check_url(cls, v: str) -> str:
+        # SSRF guard: only public, routable HTTP(S) targets may be fetched.
+        try:
+            return validate_outbound_url(v)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 @router.get("/search")
@@ -358,11 +367,32 @@ async def fetch_remote_url(
     dest_dir.mkdir(parents=True, exist_ok=True)
     name = Path(body.filename or body.url.split("/")[-1] or "downloaded.bin").name
     target = _safe_path(str(dest_dir / name))
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        resp = await client.get(body.url)
-        if not resp.is_success:
-            raise HTTPException(status_code=502, detail=f"Remote fetch failed: HTTP {resp.status_code}")
-        target.write_bytes(resp.content)
+    # Redirects are followed manually and every hop is re-validated, so a
+    # public URL cannot redirect the panel to an internal address.
+    max_bytes = 100 * 1024 * 1024
+    current_url = body.url
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+        for _ in range(5):
+            resp = await client.get(current_url)
+            if resp.is_redirect:
+                location = resp.headers.get("location")
+                if not location:
+                    raise HTTPException(status_code=502, detail="Remote fetch failed: invalid redirect")
+                current_url = str(httpx.URL(current_url).join(location))
+                try:
+                    validate_outbound_url(current_url)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"Refusing to follow redirect: {exc}") from exc
+                continue
+            if not resp.is_success:
+                raise HTTPException(status_code=502, detail=f"Remote fetch failed: HTTP {resp.status_code}")
+            content = resp.content
+            break
+        else:
+            raise HTTPException(status_code=502, detail="Remote fetch failed: too many redirects")
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail="Remote file exceeds the 100 MB limit")
+    target.write_bytes(content)
     await record_audit_event(
         db, actor=actor, request=request, permission="files:write", action="fetch_url", target_resource=str(target)
     )

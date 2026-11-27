@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 from pathlib import Path
 
@@ -53,6 +54,32 @@ class OutboundRouteUpdate(BaseModel):
     relay_port: int = Field(default=587, ge=1, le=65535)
     relay_username: str | None = None
     relay_password: str | None = None
+
+    @field_validator("relay_host")
+    @classmethod
+    def check_relay_host(cls, v: str | None) -> str | None:
+        # The relay host is rendered into Postfix map files: a newline would
+        # let the caller append arbitrary map entries (relay/redirect for
+        # domains they do not own).
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        if any(ch in cleaned for ch in ("\x00", "\r", "\n", " ", "\t", "[", "]", ",")):
+            raise ValueError(f"Invalid relay host: {v!r}")
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,255}", cleaned):
+            raise ValueError(f"Invalid relay host: {v!r}")
+        return cleaned
+
+    @field_validator("relay_username", "relay_password")
+    @classmethod
+    def check_relay_credentials(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if any(ch in v for ch in ("\x00", "\r", "\n")):
+            raise ValueError("Relay credentials must not contain newlines")
+        return v
 
 
 async def _sync_mail_maps(db: AsyncSession) -> None:
@@ -413,6 +440,22 @@ async def read_mail_logs(
 
 class CatchallUpdate(BaseModel):
     catchall_address: str | None = None
+
+    @field_validator("catchall_address")
+    @classmethod
+    def check_catchall(cls, v: str | None) -> str | None:
+        # The catch-all address is rendered into the Postfix virtual alias map;
+        # newlines would allow injecting extra map entries.
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        if any(ch in cleaned for ch in ("\x00", "\r", "\n", " ", "\t")):
+            raise ValueError(f"Invalid catch-all address: {v!r}")
+        if not re.fullmatch(r"[^@\s]{1,64}@[A-Za-z0-9.-]{1,190}", cleaned):
+            raise ValueError(f"Invalid catch-all address: {v!r}")
+        return cleaned
 
 
 @router.put("/domains/{domain_id}/catchall")

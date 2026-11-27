@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import bcrypt from 'bcryptjs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -128,13 +129,25 @@ db.exec(`
 `);
 
 function seedDefaults() {
-  const admin = db.prepare('SELECT id FROM users WHERE username = ?').get('aapanel');
-  if (!admin) {
-    const hash = bcrypt.hashSync('aapanel', 10);
-    db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('aapanel', hash, 'Administrator');
-    const admin2 = db.prepare('SELECT id FROM users WHERE username = ?').get('admin');
-    if (!admin2) {
+  // Well-known demo credentials ("aapanel"/"aapanel") are a backdoor on any
+  // reachable instance, so they are only seeded when explicitly requested
+  // (tests / local demo). Otherwise the bootstrap admin gets a random password
+  // that is printed exactly once on first run.
+  const seedDemoAccounts = process.env.NEXOPANEL_SEED_DEMO_ACCOUNTS === '1';
+  const anyUser = db.prepare('SELECT id FROM users LIMIT 1').get();
+  if (!anyUser) {
+    if (seedDemoAccounts) {
+      const hash = bcrypt.hashSync('aapanel', 10);
+      db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('aapanel', hash, 'Administrator');
       db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('admin', hash, 'Administrator');
+    } else {
+      const password = crypto.randomBytes(18).toString('base64url');
+      const hash = bcrypt.hashSync(password, 12);
+      db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('admin', hash, 'Administrator');
+      console.log(
+        `[NexoPanel] Initial admin account created -> username: admin, password: ${password}\n` +
+          '[NexoPanel] This password is shown only once. Change it immediately after first login.',
+      );
     }
   }
 
@@ -150,15 +163,19 @@ function seedDefaults() {
 
   const dbCount = db.prepare('SELECT COUNT(*) as c FROM databases').get().c;
   if (dbCount === 0) {
+    // Never ship a hard-coded database password: generate a random one.
+    const dbPassword = crypto.randomBytes(12).toString('base64url');
     db.prepare('INSERT INTO databases (engine, db_name, username, password, location, backup_count, note) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-      'mysql', 'nexopanel_prod', 'np_user', 'S3cureDbPass!', 'localhost', 1, 'Main app database'
+      'mysql', 'nexopanel_prod', 'np_user', dbPassword, 'localhost', 1, 'Main app database'
     );
   }
 
   const ftpCount = db.prepare('SELECT COUNT(*) as c FROM ftp_accounts').get().c;
   if (ftpCount === 0) {
+    // Never ship a hard-coded FTP password: generate a random one.
+    const ftpPassword = crypto.randomBytes(12).toString('base64url');
     db.prepare('INSERT INTO ftp_accounts (username, password, document_root, quota_mb, status, note) VALUES (?, ?, ?, ?, ?, ?)').run(
-      'ftp_app', 'FtpPass123!', '/www/wwwroot/app.nexopanel.local', 2048, 'active', 'Site deployment'
+      'ftp_app', ftpPassword, '/www/wwwroot/app.nexopanel.local', 2048, 'active', 'Site deployment'
     );
   }
 

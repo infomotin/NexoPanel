@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,19 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8443
     ALLOWED_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "https://localhost:8443"])
+
+    @field_validator("ALLOWED_ORIGINS")
+    @classmethod
+    def check_allowed_origins(cls, v: list[str]) -> list[str]:
+        # The API allows credentialed requests, so a reflected/wildcard origin
+        # would let any website make authenticated cross-origin calls.
+        cleaned = [origin.strip().rstrip("/") for origin in v if origin and origin.strip()]
+        for origin in cleaned:
+            if origin in {"*", "null"} or "*" in origin:
+                raise ValueError(
+                    "ALLOWED_ORIGINS must list explicit origins when credentials are allowed"
+                )
+        return cleaned
 
     # Database (Bundled SQLite 3 WAL)
     DATABASE_PATH: Path = Path("/var/lib/nexopanel/panel.db")

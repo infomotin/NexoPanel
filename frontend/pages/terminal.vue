@@ -27,14 +27,16 @@ let term: Terminal | null = null
 let ws: WebSocket | null = null
 
 onMounted(() => {
-  if (!termContainer.value || !auth.token) return
+  // The session is carried by the HttpOnly access_token cookie (same-origin),
+  // never by a token in the WebSocket URL, which would leak into proxy logs.
+  if (!termContainer.value || !auth.isAuthenticated) return
   term = new Terminal({ cursorBlink: true, fontSize: 13, theme: { background: '#0f172a' } })
   const fitAddon = new FitAddon()
   term.loadAddon(fitAddon)
   term.open(termContainer.value)
   fitAddon.fit()
 
-  ws = new WebSocket(`${wsBase}/terminal/ws?token=${encodeURIComponent(auth.token)}`)
+  ws = new WebSocket(`${wsBase}/terminal/ws`)
   ws.onopen = () => {
     connected.value = true
     ws?.send(JSON.stringify({ resize: true, rows: term?.rows || 24, cols: term?.cols || 80 }))

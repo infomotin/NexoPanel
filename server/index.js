@@ -11,9 +11,30 @@ import { db, SANDBOX_FILES_ROOT } from './db.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'nexopanel-express-dev-secret-key';
 
-app.use(cors({ origin: true, credentials: true }));
+// Never fall back to a hard-coded signing secret: any deployment that forgets
+// to set JWT_SECRET would otherwise sign tokens with a publicly known string
+// from the repository, letting anyone forge an Administrator session.
+if (!process.env.JWT_SECRET) {
+  console.error(
+    '[FATAL] JWT_SECRET environment variable is required. Generate one with:\n' +
+      "  node -e \"console.log(require('crypto').randomBytes(48).toString('base64url'))\"",
+  );
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// Reflecting any Origin while allowing credentials lets an attacker's site make
+// authenticated cross-origin calls. Only explicitly configured origins are
+// accepted (comma-separated PANEL_ORIGINS, loopback dev servers by default).
+const ALLOWED_ORIGINS = (
+  process.env.PANEL_ORIGINS ||
+  'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3001,http://127.0.0.1:3001'
+)
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
 // --- Auth Middleware ---
@@ -33,7 +54,11 @@ function requireAuth(req, res, next) {
 function resolveSafeFilePath(relPath = '') {
   const clean = String(relPath).replace(/^\/+/, '');
   const target = path.resolve(SANDBOX_FILES_ROOT, clean);
-  if (!target.startsWith(SANDBOX_FILES_ROOT)) {
+  // Compare against the root *with* a trailing separator: a plain
+  // startsWith(root) also accepts sibling paths such as <root>_backup/secret.
+  const withinRoot =
+    target === SANDBOX_FILES_ROOT || target.startsWith(SANDBOX_FILES_ROOT + path.sep);
+  if (!withinRoot) {
     throw new Error('Path traversal denied');
   }
   return target;

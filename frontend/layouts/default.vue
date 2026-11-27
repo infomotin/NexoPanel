@@ -125,17 +125,19 @@ const navItems = [
 ]
 
 const visibleNav = computed(() =>
-  navItems.filter((item) => !auth.user || auth.can(item.perm))
+  // Default-deny: with no loaded user/permissions show nothing instead of
+  // falling back to "show every entry" (!auth.user used to bypass the filter).
+  navItems.filter((item) => auth.user && auth.can(item.perm))
 )
 
 async function loadHeaderState() {
-  if (!auth.token) {
+  if (!auth.isAuthenticated) {
     navigateTo('/login')
     return
   }
   try {
     if (!auth.user) {
-      auth.user = await apiFetch('/auth/me')
+      auth.setUser(await apiFetch('/auth/me'))
     }
     telemetry.value = await apiFetch('/system/telemetry')
   } catch {
@@ -143,7 +145,15 @@ async function loadHeaderState() {
   }
 }
 
-function handleLogout() {
+async function handleLogout() {
+  try {
+    // Clear the HttpOnly access_token cookie as well as the in-memory token,
+    // otherwise the cookie would silently restore the session on the next
+    // navigation.
+    await apiFetch('/auth/logout', { method: 'POST' })
+  } catch {
+    // Local logout must still succeed if the server call fails.
+  }
   auth.clearSession()
   navigateTo('/login')
 }

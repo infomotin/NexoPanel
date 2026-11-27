@@ -11,13 +11,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import record_audit_event
 from app.core.rbac import require_permission
 from app.core.security import secret_manager
-from app.core.validators import validate_db_identifier
+from app.core.validators import escape_sql_string_literal, validate_db_identifier
 from app.db.models import BackupManifest, ManagedDatabase, PanelSetting, User
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.services.executor import get_node_executor
 
 router = APIRouter(prefix="/databases", tags=["Database Administration"])
+
+# The database clients run with root/superuser privileges over the local
+# socket, so the session's string-escaping semantics are pinned explicitly:
+#   * MariaDB/MySQL's default sql_mode treats "\" as an escape character, which
+#     would allow a password containing a backslash to break out of the quoted
+#     literal and inject SQL into a root-privileged statement.
+#   * PostgreSQL's standard_conforming_strings is pinned to "on" so that quote
+#     doubling is always the correct (and only) escape.
+MARIADB_SESSION_PREFIX = "SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',NO_BACKSLASH_ESCAPES');"
+POSTGRES_SESSION_PREFIX = "SET standard_conforming_strings = on;"
+
+
+def _mariadb_sql(statement: str) -> str:
+    return f"{MARIADB_SESSION_PREFIX} {statement}"
+
+
+def _postgres_sql(statement: str) -> str:
+    return f"{POSTGRES_SESSION_PREFIX} {statement}"
 
 
 async def _get_db_meta(db: AsyncSession, engine: str, db_name: str) -> dict:
@@ -177,9 +195,9 @@ async def create_database(
         raise HTTPException(status_code=409, detail="Database already exists")
 
     executor = get_node_executor()
-    safe_pw = body.db_password.replace("'", "''")
+    safe_pw = escape_sql_string_literal(body.db_password)
     if body.engine == "mariadb":
-        sql = (
+        sql = _mariadb_sql(
             f"CREATE DATABASE IF NOT EXISTS `{body.db_name}` CHARACTER SET {body.charset}; "
             f"CREATE USER IF NOT EXISTS '{body.db_user}'@'{body.db_host}' IDENTIFIED BY '{safe_pw}'; "
             f"GRANT ALL PRIVILEGES ON `{body.db_name}`.* TO '{body.db_user}'@'{body.db_host}'; "
@@ -187,7 +205,7 @@ async def create_database(
         )
         res = await executor.run_command(["/usr/bin/mariadb", "-e", sql])
     else:
-        sql = (
+        sql = _postgres_sql(
             f"DO $$ BEGIN CREATE USER {body.db_user} WITH PASSWORD '{safe_pw}'; "
             f"EXCEPTION WHEN duplicate_object THEN ALTER USER {body.db_user} WITH PASSWORD '{safe_pw}'; END $$; "
             f"CREATE DATABASE {body.db_name} OWNER {body.db_user};"
@@ -240,12 +258,12 @@ async def rotate_database_password(
         raise HTTPException(status_code=404, detail="Database not found")
 
     executor = get_node_executor()
-    safe_pw = body.new_password.replace("'", "''")
+    safe_pw = escape_sql_string_literal(body.new_password)
     if rec.engine == "mariadb":
-        sql = f"ALTER USER '{rec.db_user}'@'{rec.db_host}' IDENTIFIED BY '{safe_pw}'; FLUSH PRIVILEGES;"
+        sql = _mariadb_sql(f"ALTER USER '{rec.db_user}'@'{rec.db_host}' IDENTIFIED BY '{safe_pw}'; FLUSH PRIVILEGES;")
         res = await executor.run_command(["/usr/bin/mariadb", "-e", sql])
     else:
-        sql = f"ALTER USER {rec.db_user} WITH PASSWORD '{safe_pw}';"
+        sql = _postgres_sql(f"ALTER USER {rec.db_user} WITH PASSWORD '{safe_pw}';")
         res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", sql])
 
     if not res.ok:
@@ -347,12 +365,12 @@ async def set_root_password(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     executor = get_node_executor()
-    safe_pw = body.password.replace("'", "''")
+    safe_pw = escape_sql_string_literal(body.password)
     if body.engine == "mariadb":
-        sql = f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{safe_pw}'; FLUSH PRIVILEGES;"
+        sql = _mariadb_sql(f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{safe_pw}'; FLUSH PRIVILEGES;")
         res = await executor.run_command(["/usr/bin/mariadb", "-e", sql])
     else:
-        sql = f"ALTER USER postgres WITH PASSWORD '{safe_pw}';"
+        sql = _postgres_sql(f"ALTER USER postgres WITH PASSWORD '{safe_pw}';")
         res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-c", sql])
     if not res.ok:
         raise HTTPException(status_code=500, detail=f"Failed to update root password: {res.stderr}")
@@ -442,17 +460,19 @@ async def update_database_permission(
         pw = ""
         if meta.get("password_enc"):
             try:
-                pw = secret_manager.decrypt(meta["password_enc"]).replace("'", "''")
+                pw = escape_sql_string_literal(secret_manager.decrypt(meta["password_enc"]))
             except Exception:
                 pw = ""
         if pw:
-            sql = (
+            sql = _mariadb_sql(
                 f"CREATE USER IF NOT EXISTS '{rec.db_user}'@'{new_host}' IDENTIFIED BY '{pw}'; "
                 f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; "
                 "FLUSH PRIVILEGES;"
             )
         else:
-            sql = f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; FLUSH PRIVILEGES;"
+            sql = _mariadb_sql(
+                f"GRANT ALL PRIVILEGES ON `{rec.db_name}`.* TO '{rec.db_user}'@'{new_host}'; FLUSH PRIVILEGES;"
+            )
         await executor.run_command(["/usr/bin/mariadb", "-e", sql])
 
     rec.db_host = new_host

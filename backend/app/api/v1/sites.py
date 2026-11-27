@@ -11,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import record_audit_event
 from app.core.config import settings
 from app.core.rbac import require_permission
-from app.core.validators import validate_domain
+from app.core.validators import (
+    sanitize_nginx_directive_value,
+    validate_domain,
+    validate_proxy_upstream,
+)
 from app.db.models import Subdomain, User, Website
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
@@ -19,6 +23,23 @@ from app.drivers.webserver import NginxProvider, VhostConfig
 from app.services.executor import get_node_executor
 
 router = APIRouter(prefix="/sites", tags=["Websites & Subdomains"])
+
+
+def _check_custom_directives(value: str | None) -> str | None:
+    """Validate free-form nginx directives.
+
+    The rendered value is injected into the vhost template, so a closing brace
+    would end the server block and let the caller inject arbitrary additional
+    nginx configuration (new listeners, `default_server`, `include`, ...).
+    """
+    if value is None:
+        return value
+    cleaned = sanitize_nginx_directive_value(value)
+    if any(ch in cleaned for ch in ("{", "}")):
+        raise ValueError("Braces are not allowed in custom nginx directives")
+    if "include" in cleaned.lower():
+        raise ValueError("'include' is not allowed in custom nginx directives")
+    return cleaned
 
 
 class WebsiteCreate(BaseModel):
@@ -40,6 +61,18 @@ class WebsiteCreate(BaseModel):
     def check_aliases(cls, v: list[str]) -> list[str]:
         return [validate_domain(a) for a in v]
 
+    @field_validator("custom_directives")
+    @classmethod
+    def check_custom(cls, v: str) -> str:
+        return _check_custom_directives(v) or ""
+
+    @field_validator("proxy_upstream")
+    @classmethod
+    def check_upstream(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return validate_proxy_upstream(v)
+
 
 class WebsiteUpdate(BaseModel):
     aliases: list[str] | None = None
@@ -50,6 +83,18 @@ class WebsiteUpdate(BaseModel):
     force_https: bool | None = None
     status: str | None = Field(default=None, pattern="^(active|suspended)$")
 
+    @field_validator("custom_directives")
+    @classmethod
+    def check_custom(cls, v: str | None) -> str | None:
+        return _check_custom_directives(v)
+
+    @field_validator("proxy_upstream")
+    @classmethod
+    def check_upstream(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return validate_proxy_upstream(v)
+
 
 class SubdomainCreate(BaseModel):
     website_id: int
@@ -58,6 +103,13 @@ class SubdomainCreate(BaseModel):
     php_version: str | None = "8.2"
     proxy_upstream: str | None = None
     create_dns_record: bool = False
+
+    @field_validator("proxy_upstream")
+    @classmethod
+    def check_upstream(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return validate_proxy_upstream(v)
 
 
 async def _apply_nginx_vhost_with_rollback(

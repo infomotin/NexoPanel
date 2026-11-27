@@ -20,7 +20,9 @@ router = APIRouter(prefix="/terminal", tags=["Web Terminal"])
 
 @router.websocket("/ws")
 async def terminal_websocket(websocket: WebSocket) -> None:
-    token = websocket.query_params.get("token") or websocket.cookies.get("access_token")
+    # Authenticate with the HttpOnly session cookie only: a token in the query
+    # string would be written to proxy/access logs and browser history.
+    token = websocket.cookies.get("access_token")
     if not token:
         await websocket.close(code=4401)
         return

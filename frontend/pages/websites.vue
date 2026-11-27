@@ -54,7 +54,7 @@
                 <div class="flex items-center gap-2">
                   <span class="w-5 h-5 rounded bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-bold shrink-0">N</span>
                   <div>
-                    <a :href="`http://${site.domain}`" target="_blank" class="font-semibold text-slate-900 hover:text-emerald-600">{{ site.domain }}</a>
+                    <a :href="`${site.ssl_enabled ? 'https' : 'http'}://${site.domain}`" target="_blank" rel="noopener noreferrer" class="font-semibold text-slate-900 hover:text-emerald-600">{{ site.domain }}</a>
                     <div class="text-[10px] font-mono text-slate-400 mt-0.5">{{ site.document_root }}</div>
                   </div>
                 </div>

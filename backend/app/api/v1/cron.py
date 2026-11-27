@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
 from app.core.rbac import require_permission
+from app.core.validators import validate_outbound_url
 from app.db.models import CronJob, User
 from app.db.session import get_db
 from app.services.executor import get_node_executor
@@ -96,8 +97,11 @@ async def run_cron_job_now(
     status_str = "success"
     if job.job_type == "url":
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(job.command_or_target)
+            # SSRF guard: a scheduled URL job must not be usable to reach
+            # loopback, link-local (cloud metadata) or private addresses.
+            target_url = validate_outbound_url(job.command_or_target)
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                r = await client.get(target_url)
                 output = f"HTTP {r.status_code}: {r.text[:500]}"
                 if not r.is_success:
                     status_str = "failed"

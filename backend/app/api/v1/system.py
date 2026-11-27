@@ -86,7 +86,8 @@ async def get_telemetry(_: User = Depends(require_permission("telemetry:read")))
 
 @router.websocket("/telemetry/ws")
 async def telemetry_stream(websocket: WebSocket) -> None:
-    token = websocket.query_params.get("token") or websocket.cookies.get("access_token")
+    # Authenticate with the HttpOnly session cookie only (no token in the URL).
+    token = websocket.cookies.get("access_token")
     if not token:
         await websocket.close(code=4401)
         return

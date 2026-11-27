@@ -25,10 +25,16 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+# The interactive API documentation exposes the complete endpoint inventory to
+# unauthenticated visitors, so it is only served outside production.
+_docs_enabled = settings.ENVIRONMENT != "production" or settings.DEBUG
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
 app.add_middleware(

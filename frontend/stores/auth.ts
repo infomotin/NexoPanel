@@ -11,11 +11,17 @@ export interface PanelUser {
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
-    token: (typeof localStorage !== 'undefined' ? localStorage.getItem('np_token') : null) as string | null,
+    // The JWT is held in memory only. It is never written to localStorage or
+    // sessionStorage, so an XSS payload cannot exfiltrate it; after a page
+    // reload the session is restored from the HttpOnly `access_token` cookie
+    // (set by the backend) via `GET /auth/me`.
+    token: null as string | null,
     user: null as PanelUser | null,
+    // True once the session has been confirmed against the server.
+    sessionChecked: false,
   }),
   getters: {
-    isAuthenticated: (state) => Boolean(state.token),
+    isAuthenticated: (state) => Boolean(state.user),
     can: (state) => (perm: string) => {
       if (!state.user) return false
       return state.user.permissions.includes('*') || state.user.permissions.includes(perm)
@@ -25,16 +31,16 @@ export const useAuthStore = defineStore('auth', {
     setSession(token: string, user: PanelUser) {
       this.token = token
       this.user = user
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem('np_token', token)
-      }
+      this.sessionChecked = true
+    },
+    setUser(user: PanelUser | null) {
+      this.user = user
+      this.sessionChecked = true
     },
     clearSession() {
       this.token = null
       this.user = null
-      if (typeof localStorage !== 'undefined') {
-        localStorage.removeItem('np_token')
-      }
+      this.sessionChecked = false
     },
   },
 })

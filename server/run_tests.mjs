@@ -1,9 +1,17 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import crypto from 'node:crypto';
 
 const srv = spawn('node', ['server/index.js'], {
   stdio: 'inherit',
-  env: { ...process.env, PORT: '3001' },
+  env: {
+    ...process.env,
+    PORT: '3001',
+    // The server refuses to start without an explicit signing secret.
+    JWT_SECRET: process.env.JWT_SECRET || crypto.randomBytes(48).toString('base64url'),
+    // Test fixtures rely on the opt-in demo accounts.
+    NEXOPANEL_SEED_DEMO_ACCOUNTS: '1',
+  },
 });
 
 srv.on('error', (err) => {
