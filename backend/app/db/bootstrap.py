@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import secrets
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.rbac import ALL_PERMISSIONS
@@ -15,6 +15,16 @@ from app.db.session import Base, engine
 async def init_db_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight additive column migration for existing SQLite deployments
+        for col_sql in (
+            "ALTER TABLE ftp_accounts ADD COLUMN password_encrypted TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE ftp_accounts ADD COLUMN note VARCHAR(255) NOT NULL DEFAULT ''",
+            "ALTER TABLE ftp_accounts ADD COLUMN expires_at DATETIME",
+        ):
+            try:
+                await conn.execute(text(col_sql))
+            except Exception:
+                pass
 
 
 async def seed_defaults(db: AsyncSession, initial_admin_password: str | None = None) -> str | None:

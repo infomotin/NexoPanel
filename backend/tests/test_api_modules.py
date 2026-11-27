@@ -149,13 +149,61 @@ async def test_firewall_cron_processes_docker_and_trash(client: AsyncClient, adm
     assert presets.status_code == 200
     assert "wordpress" in presets.json()
 
-    # FTP Account
+    # FTP Account Full aaPanel Workflow & Security Validation
     roots = (await client.get("/api/v1/files/roots", headers=admin_headers)).json()["roots"]
+
+    # Security: reject invalid username & critical directory / path traversal
+    bad_user = await client.post(
+        "/api/v1/ftp",
+        headers=admin_headers,
+        json={"username": "bad user!", "password": "FtpPassword123!", "home_directory": roots[0]},
+    )
+    assert bad_user.status_code == 422
+
+    bad_path = await client.post(
+        "/api/v1/ftp",
+        headers=admin_headers,
+        json={"username": "ftp_sec1", "password": "FtpPassword123!", "home_directory": "/etc"},
+    )
+    assert bad_path.status_code == 403
+
     ftp_res = await client.post(
         "/api/v1/ftp",
         headers=admin_headers,
-        json={"username": "ftp_user1", "password": "FtpPassword123!", "home_directory": roots[0]},
+        json={"username": "ftp_user1", "password": "FtpPassword123!", "home_directory": roots[0], "quota_mb": 512, "note": "Initial"},
     )
     assert ftp_res.status_code == 201
+    ftp_id = ftp_res.json()["id"]
     assert ftp_res.json()["username"] == "ftp_user1"
+
+    # Reveal & Rotate password
+    reveal = await client.get(f"/api/v1/ftp/{ftp_id}/password/reveal", headers=admin_headers)
+    assert reveal.status_code == 200
+    assert reveal.json()["password"] == "FtpPassword123!"
+
+    rot = await client.put(f"/api/v1/ftp/{ftp_id}/password", headers=admin_headers, json={"password": "NewStrongPass99!"})
+    assert rot.status_code == 200
+
+    # Set Path (set_user_home) & Note & Quota & Status Toggle
+    assert (await client.put(f"/api/v1/ftp/{ftp_id}/home", headers=admin_headers, json={"home_directory": f"{roots[0]}/site_sub", "migrate": True})).status_code == 200
+    assert (await client.put(f"/api/v1/ftp/{ftp_id}/note", headers=admin_headers, json={"note": "Updated Note"})).status_code == 200
+    assert (await client.put(f"/api/v1/ftp/{ftp_id}/quota", headers=admin_headers, json={"quota_mb": 1024})).status_code == 200
+    assert (await client.post(f"/api/v1/ftp/{ftp_id}/toggle", headers=admin_headers)).json()["is_active"] is False
+
+    # Logs, Port, Firewall Sync, Security Hardening, Scan & Whitelist
+    assert (await client.get(f"/api/v1/ftp/{ftp_id}/logs/login", headers=admin_headers)).status_code == 200
+    assert (await client.get(f"/api/v1/ftp/{ftp_id}/logs/action", headers=admin_headers)).status_code == 200
+    assert (await client.put("/api/v1/ftp/port", headers=admin_headers, json={"port": 2121})).status_code == 200
+    assert (await client.put("/api/v1/ftp/port", headers=admin_headers, json={"port": 99999})).status_code == 422
+    assert (await client.put("/api/v1/ftp/security", headers=admin_headers, json={"no_anonymous": True, "forbid_root": True})).status_code == 200
+    assert (await client.post("/api/v1/ftp/log-analysis/scan", headers=admin_headers, json={"types": ["login_error", "area", "upload_shell", "anonymous"], "day": 30})).status_code == 200
+    assert (await client.post("/api/v1/ftp/whitelist", headers=admin_headers, json={"ip": "invalid-ip"})).status_code == 422
+    assert (await client.post("/api/v1/ftp/whitelist", headers=admin_headers, json={"ip": "203.0.113.10"})).status_code == 200
+    assert "203.0.113.10" in (await client.get("/api/v1/ftp/whitelist", headers=admin_headers)).json()["ips"]
+    assert (await client.delete("/api/v1/ftp/whitelist/203.0.113.10", headers=admin_headers)).status_code == 200
+
+    # Batch Delete
+    batch = await client.post("/api/v1/ftp/batch-delete", headers=admin_headers, json={"ids": [ftp_id]})
+    assert batch.status_code == 200
+    assert batch.json()["results"][0]["ok"] is True
 

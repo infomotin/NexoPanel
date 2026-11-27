@@ -46,6 +46,27 @@ db.exec(`
     quota_mb INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active',
     note TEXT NOT NULL DEFAULT '',
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS ftp_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    log_kind TEXT NOT NULL DEFAULT 'login',
+    action_type TEXT NOT NULL DEFAULT 'login_success',
+    ip TEXT NOT NULL DEFAULT '127.0.0.1',
+    country TEXT NOT NULL DEFAULT 'Local',
+    file_path TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'Success',
+    in_time TEXT NOT NULL DEFAULT (datetime('now')),
+    out_time TEXT NOT NULL DEFAULT '--',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS ftp_whitelist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT UNIQUE NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -141,6 +162,25 @@ function seedDefaults() {
     );
   }
 
+  try {
+    db.exec("ALTER TABLE ftp_accounts ADD COLUMN expires_at TEXT");
+  } catch { /* column already exists */ }
+
+  const ftpLogCount = db.prepare('SELECT COUNT(*) as c FROM ftp_logs').get().c;
+  if (ftpLogCount === 0) {
+    const insLog = db.prepare(
+      'INSERT INTO ftp_logs (username, log_kind, action_type, ip, country, file_path, status, in_time, out_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    insLog.run('ftp_app', 'login', 'login_success', '192.168.1.45', 'Local', '', 'Success', nowIso, nowIso);
+    insLog.run('ftp_app', 'action', 'upload', '192.168.1.45', 'Local', '/www/wwwroot/app.nexopanel.local/index.html', 'Success', nowIso, '--');
+    insLog.run('ftp_app', 'action', 'download', '192.168.1.45', 'Local', '/www/wwwroot/app.nexopanel.local/config.json', 'Success', nowIso, '--');
+    insLog.run('ftp_app', 'action', 'upload', '203.0.113.77', 'Unknown', '/www/wwwroot/app.nexopanel.local/shell.php', 'Success', nowIso, '--');
+    for (let i = 0; i < 6; i++) {
+      insLog.run('ftp_app', 'login', 'login_fail', '198.51.100.24', 'Unknown', '', 'Failure', nowIso, nowIso);
+    }
+  }
+
   const fwCount = db.prepare('SELECT COUNT(*) as c FROM firewall_rules').get().c;
   if (fwCount === 0) {
     const insFw = db.prepare('INSERT INTO firewall_rules (protocol, port, strategy, direction, source_ip, remarks) VALUES (?, ?, ?, ?, ?, ?)');
@@ -181,6 +221,18 @@ function seedDefaults() {
     monitoring_days: '30',
     memo: 'Reset every 3 hours. Demo workspace ready.',
     api_enabled: 'true',
+    ftp_port: '21',
+    ftp_log_service: 'start',
+    ftp_no_anonymous: 'true',
+    ftp_forbid_root: 'true',
+    ftp_scan_config: JSON.stringify({
+      login_error: 5,
+      area: { country: ['Local', 'US', 'DE', 'SG'] },
+      time: { start_time: 6, end_time: 23 },
+      upload_shell: ['.php', '.sh', '.py', '.jsp', '.asp'],
+      auto_scan: false,
+      cron_task_status: 0,
+    }),
   };
   const insSet = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of Object.entries(defaultSettings)) {

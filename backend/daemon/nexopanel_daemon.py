@@ -42,6 +42,10 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/docker",
     "/usr/bin/crontab",
     "/bin/kill",
+    "/usr/bin/pure-pw",
+    "/usr/sbin/pure-ftpd",
+    "/bin/cp",
+    "/usr/bin/cp",
 }
 
 ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
@@ -50,6 +54,7 @@ ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "/etc/postfix/",
     "/etc/dovecot/",
     "/etc/opendkim/",
+    "/etc/pure-ftpd/",
     "/var/www/",
     "/var/mail/vhosts/",
     "/var/backups/nexopanel/",

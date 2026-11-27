@@ -109,3 +109,44 @@ test('Operations: Website, Database, File, Cron, Firewall, and App Store flows',
   const apps = await (await fetch(`${BASE}/apps`, { headers })).json();
   assert.ok(apps.length > 0);
 });
+
+test('FTP Module: full aaPanel parity & security validation', async () => {
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  // Security validations: bad username, critical path, path traversal, invalid port & IP
+  assert.equal((await fetch(`${BASE}/ftp`, { method: 'POST', headers, body: JSON.stringify({ username: 'bad user!', password: 'FtpPass123!', document_root: '/www/wwwroot/x' }) })).status, 400);
+  assert.equal((await fetch(`${BASE}/ftp`, { method: 'POST', headers, body: JSON.stringify({ username: 'valid_u1', password: 'FtpPass123!', document_root: '/etc' }) })).status, 403);
+  assert.equal((await fetch(`${BASE}/ftp`, { method: 'POST', headers, body: JSON.stringify({ username: 'valid_u2', password: 'FtpPass123!', document_root: '/www/wwwroot/../../etc' }) })).status, 403);
+  assert.equal((await fetch(`${BASE}/ftp/port`, { method: 'PUT', headers, body: JSON.stringify({ port: 70000 }) })).status, 400);
+  assert.equal((await fetch(`${BASE}/ftp/whitelist`, { method: 'POST', headers, body: JSON.stringify({ ip: 'not-an-ip' }) })).status, 400);
+
+  // Create FTP user -> Overview -> Password -> Set Path -> Note -> Quota -> Logs -> Scan -> Whitelist -> Batch Delete
+  const uname = `ftp_test_${Date.now()}`.slice(0, 24);
+  const created = await fetch(`${BASE}/ftp`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ username: uname, password: 'StrongFtpPass99!', document_root: `/www/wwwroot/${uname}`, quota_mb: 512, note: 'Test FTP' }),
+  });
+  assert.equal(created.status, 201);
+  const ftpRow = await created.json();
+
+  const ov = await (await fetch(`${BASE}/ftp/overview`, { headers })).json();
+  assert.ok(Array.isArray(ov.items));
+
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/password`, { method: 'PUT', headers, body: JSON.stringify({ password: 'RotatedFtp99!' }) })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/home`, { method: 'PUT', headers, body: JSON.stringify({ document_root: `/www/wwwroot/${uname}_v2`, migrate: true }) })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/note`, { method: 'PUT', headers, body: JSON.stringify({ note: 'Migrated' }) })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/quota`, { method: 'PUT', headers, body: JSON.stringify({ quota_mb: 1024 }) })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/logs/login`, { headers })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/${ftpRow.id}/logs/action`, { headers })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/security`, { method: 'PUT', headers, body: JSON.stringify({ no_anonymous: true, forbid_root: true }) })).status, 200);
+
+  const scanRes = await (await fetch(`${BASE}/ftp/log-analysis/scan`, { method: 'POST', headers, body: JSON.stringify({ types: ['login_error', 'upload_shell', 'area', 'anonymous'], day: 30 }) })).json();
+  assert.ok(scanRes.total >= 1);
+
+  assert.equal((await fetch(`${BASE}/ftp/whitelist`, { method: 'POST', headers, body: JSON.stringify({ ip: '198.51.100.24' }) })).status, 200);
+  assert.equal((await fetch(`${BASE}/ftp/whitelist/198.51.100.24`, { method: 'DELETE', headers })).status, 200);
+
+  const batchDel = await (await fetch(`${BASE}/ftp/batch-delete`, { method: 'POST', headers, body: JSON.stringify({ ids: [ftpRow.id] }) })).json();
+  assert.equal(batchDel.results[0].ok, true);
+});

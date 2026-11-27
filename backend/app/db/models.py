@@ -352,9 +352,27 @@ class FtpAccount(Base):
     node_id: Mapped[str] = mapped_column(String(64), default="local-node-01", nullable=False)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
     home_directory: Mapped[str] = mapped_column(String(512), nullable=False)
     quota_mb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 0 = unlimited
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    note: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class FtpLogEntry(Base):
+    __tablename__ = "ftp_log_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    log_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # login | action
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)  # login_success | login_fail | upload | download | rename | delete
+    ip: Mapped[str] = mapped_column(String(64), default="127.0.0.1", nullable=False)
+    country: Mapped[str] = mapped_column(String(64), default="Local", nullable=False)
+    file_path: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Success", nullable=False)
+    in_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    out_time: Mapped[str] = mapped_column(String(64), default="", nullable=False)
 
 
