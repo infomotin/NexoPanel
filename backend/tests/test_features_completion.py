@@ -112,3 +112,100 @@ async def test_app_deploy_persists_revealable_database_password(
     )
     assert reveal.status_code == 200
     assert reveal.json()["password"]
+
+
+async def test_firewall_advanced_controls(client: AsyncClient, admin_headers: dict[str, str]):
+    # 1. Status
+    status_res = await client.get("/api/v1/firewall/status", headers=admin_headers)
+    assert status_res.status_code == 200
+    assert "active" in status_res.json()
+    assert "default_incoming" in status_res.json()
+
+    # 2. Default policy & reload
+    pol_res = await client.post(
+        "/api/v1/firewall/default-policy",
+        headers=admin_headers,
+        json={"direction": "incoming", "policy": "deny"},
+    )
+    assert pol_res.status_code == 200
+
+    reload_res = await client.post("/api/v1/firewall/reload", headers=admin_headers)
+    assert reload_res.status_code == 200
+
+    # 3. Listening ports
+    ports_res = await client.get("/api/v1/firewall/listening-ports", headers=admin_headers)
+    assert ports_res.status_code == 200
+    ports = ports_res.json()
+    assert isinstance(ports, list)
+    assert any(p["port"] == "22" for p in ports)
+
+    # 4. Services list & toggle
+    svc_res = await client.get("/api/v1/firewall/services", headers=admin_headers)
+    assert svc_res.status_code == 200
+    services = svc_res.json()
+    assert any(s["key"] == "web_https" for s in services)
+
+    toggle_svc = await client.post(
+        "/api/v1/firewall/services/toggle",
+        headers=admin_headers,
+        json={"service_key": "web_https", "enable": True, "source_ip": "any"},
+    )
+    assert toggle_svc.status_code == 200
+    assert toggle_svc.json()["enabled"] is True
+
+    # 5. IP rules (whole IP block with port='any' and CIDR)
+    ip_rule = await client.post(
+        "/api/v1/firewall/rules",
+        headers=admin_headers,
+        json={"port": "any", "protocol": "any", "action": "deny", "source_ip": "198.51.100.0/24", "comment": "Block subnet"},
+    )
+    assert ip_rule.status_code == 201
+    rule_id = ip_rule.json()["id"]
+
+    del_rule = await client.delete(f"/api/v1/firewall/rules/{rule_id}", headers=admin_headers)
+    assert del_rule.status_code == 200
+
+    # 6. Country blocks
+    cat_res = await client.get("/api/v1/firewall/countries/catalog", headers=admin_headers)
+    assert cat_res.status_code == 200
+    assert any(c["code"] == "RU" for c in cat_res.json())
+
+    cb_res = await client.post(
+        "/api/v1/firewall/countries",
+        headers=admin_headers,
+        json={"country_code": "RU", "country_name": "Russia", "action": "deny"},
+    )
+    assert cb_res.status_code == 201
+    block_id = cb_res.json()["id"]
+
+    blocks_list = await client.get("/api/v1/firewall/countries", headers=admin_headers)
+    assert blocks_list.status_code == 200
+    assert any(b["country_code"] == "RU" for b in blocks_list.json())
+
+    del_cb = await client.delete(f"/api/v1/firewall/countries/{block_id}", headers=admin_headers)
+    assert del_cb.status_code == 200
+
+    # 7. Fail2Ban
+    f2b_res = await client.get("/api/v1/firewall/fail2ban?jail=sshd", headers=admin_headers)
+    assert f2b_res.status_code == 200
+    assert "currently_banned" in f2b_res.json()
+
+    ban_res = await client.post(
+        "/api/v1/firewall/fail2ban/ban",
+        headers=admin_headers,
+        json={"jail": "sshd", "ip": "203.0.113.199"},
+    )
+    assert ban_res.status_code == 200
+
+    unban_res = await client.post(
+        "/api/v1/firewall/fail2ban/unban",
+        headers=admin_headers,
+        json={"jail": "sshd", "ip": "203.0.113.199"},
+    )
+    assert unban_res.status_code == 200
+
+    # 8. Live logs
+    logs_res = await client.get("/api/v1/firewall/logs?lines=20", headers=admin_headers)
+    assert logs_res.status_code == 200
+    assert isinstance(logs_res.json(), list)
+

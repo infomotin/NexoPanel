@@ -310,11 +310,22 @@ class FirewallRule(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     node_id: Mapped[str] = mapped_column(String(64), default="local-node-01", nullable=False)
-    port: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "80", "443", "8000:8100"
+    port: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "80", "443", "8000:8100", "any"
     protocol: Mapped[str] = mapped_column(String(16), default="tcp", nullable=False)  # tcp | udp | any
     action: Mapped[str] = mapped_column(String(16), default="allow", nullable=False)  # allow | deny
     source_ip: Mapped[str] = mapped_column(String(64), default="any", nullable=False)
     comment: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class CountryBlock(Base):
+    __tablename__ = "country_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(String(64), default="local-node-01", nullable=False)
+    country_code: Mapped[str] = mapped_column(String(8), unique=True, nullable=False, index=True)
+    country_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), default="deny", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
