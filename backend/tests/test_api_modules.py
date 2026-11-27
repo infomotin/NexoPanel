@@ -100,6 +100,10 @@ async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict
     assert (await client.delete(f"/api/v1/dns/providers/{prov_id}", headers=admin_headers)).status_code == 200
 
     # Mail
+    status = await client.get("/api/v1/mail/status", headers=admin_headers)
+    assert status.status_code == 200
+    assert "postfix" in status.json()["services"]
+
     md = await client.post("/api/v1/mail/domains", headers=admin_headers, json={"domain": "mail.example.com"})
     assert md.status_code == 201
     md_id = md.json()["id"]
@@ -109,9 +113,35 @@ async def test_dns_mail_ssl_and_backups(client: AsyncClient, admin_headers: dict
         json={"mail_domain_id": md_id, "local_part": "hello", "password": "MailPassword123!"},
     )
     assert mbox.status_code == 201
+    mbox_id = mbox.json()["id"]
+
+    updated = await client.put(
+        f"/api/v1/mail/mailboxes/{mbox_id}",
+        headers=admin_headers,
+        json={"quota_mb": 2048, "is_active": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["quota_mb"] == 2048
+    assert updated.json()["is_active"] is False
+
+    alias = await client.post(
+        "/api/v1/mail/aliases",
+        headers=admin_headers,
+        json={
+            "mail_domain_id": md_id,
+            "source_email": "sales@mail.example.com",
+            "destination_email": "hello@mail.example.com",
+        },
+    )
+    assert alias.status_code == 201
+    assert (await client.delete(f"/api/v1/mail/aliases/{alias.json()['id']}", headers=admin_headers)).status_code == 200
+
     readiness = await client.get(f"/api/v1/mail/domains/{md_id}/dns-readiness", headers=admin_headers)
     assert readiness.status_code == 200
-    assert len(readiness.json()["required_records"]) == 4
+    assert len(readiness.json()["required_records"]) == 5
+    assert readiness.json()["live_checks_enabled"] is False
+
+    assert (await client.delete(f"/api/v1/mail/domains/{md_id}", headers=admin_headers)).status_code == 200
 
     # SSL HTTP-01 (mock executor)
     ssl_res = await client.post(

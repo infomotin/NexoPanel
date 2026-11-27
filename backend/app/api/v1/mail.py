@@ -5,22 +5,26 @@ import json
 import re
 import socket
 from pathlib import Path
+from typing import Any
 
 import dns.resolver
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
+from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.security import hash_dovecot_sha512_crypt, secret_manager
 from app.core.validators import QUEUE_ID_RE, validate_domain
-from app.db.models import MailAlias, MailDomain, Mailbox, User
+from app.db.models import MailAlias, Mailbox, MailDomain, User
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.drivers.mail import OutboundMailRouter, OutboundRouteConfig, generate_dkim_keypair
 from app.services.executor import get_node_executor
+
+SERVICE_STATES = {"active", "inactive", "failed", "activating", "deactivating", "unknown"}
 
 router = APIRouter(prefix="/mail", tags=["Mail Server & Routing"])
 
@@ -40,6 +44,12 @@ class MailboxCreate(BaseModel):
     local_part: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9._+-]+$")
     password: str = Field(min_length=8, max_length=128)
     quota_mb: int = Field(default=1024, ge=50, le=102400)
+
+
+class MailboxUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    quota_mb: int | None = Field(default=None, ge=50, le=102400)
+    is_active: bool | None = None
 
 
 class AliasCreate(BaseModel):
@@ -82,6 +92,47 @@ class OutboundRouteUpdate(BaseModel):
         return v
 
 
+def _detect_server_ip() -> str:
+    """Best-effort primary IP of this host (no packet is actually sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(("1.1.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.getfqdn())
+    except OSError:
+        return "127.0.0.1"
+
+
+def _mail_hostname() -> str:
+    host = (socket.getfqdn() or "").strip().rstrip(".")
+    if "." in host and not host.endswith("localdomain") and not host.endswith("localhost"):
+        return host
+    return ""
+
+
+def _maildir_base(domain: str, local_part: str) -> Path:
+    return settings.MAIL_DIR_BASE / domain / local_part
+
+
+async def _ensure_maildir(domain: str, local_part: str) -> None:
+    """Create the Dovecot Maildir skeleton for a mailbox (idempotent)."""
+    distro = get_distro_driver()
+    executor = get_node_executor()
+    base = _maildir_base(domain, local_part)
+    for path in (base, base / "Maildir", base / "Maildir" / "cur", base / "Maildir" / "new", base / "Maildir" / "tmp"):
+        await executor.ensure_directory(
+            str(path), owner=distro.paths.mail_user, group=distro.paths.mail_group, mode=0o700
+        )
+
+
+def _render_lines(lines: list[str]) -> str:
+    return "\n".join(sorted(lines)) + "\n" if lines else ""
+
+
 async def _sync_mail_maps(db: AsyncSession) -> None:
     distro = get_distro_driver()
     executor = get_node_executor()
@@ -89,20 +140,27 @@ async def _sync_mail_maps(db: AsyncSession) -> None:
     mailboxes = (await db.execute(select(Mailbox))).scalars().all()
     aliases = (await db.execute(select(MailAlias))).scalars().all()
 
-    domain_lines = "\n".join(f"{d.domain} OK" for d in domains) + "\n"
+    domain_lines = _render_lines([f"{d.domain} OK" for d in domains])
     await executor.write_privileged_file(distro.paths.postfix_virtual_mailbox_domains, domain_lines)
 
-    mbox_lines = "\n".join(f"{m.email} {m.email.split('@')[1]}/{m.email.split('@')[0]}/" for m in mailboxes) + "\n"
+    mbox_lines = _render_lines(
+        [f"{m.email} {m.email.split('@')[1]}/{m.email.split('@')[0]}/" for m in mailboxes]
+    )
     await executor.write_privileged_file(distro.paths.postfix_virtual_mailbox_maps, mbox_lines)
 
-    alias_lines = "\n".join(f"{a.source_email} {a.destination_email}" for a in aliases) + "\n"
-    await executor.write_privileged_file(distro.paths.postfix_virtual_alias_maps, alias_lines)
+    alias_lines = [f"{a.source_email} {a.destination_email}" for a in aliases]
+    for d in domains:
+        if d.catchall_address:
+            alias_lines.append(f"@{d.domain} {d.catchall_address}")
+    await executor.write_privileged_file(distro.paths.postfix_virtual_alias_maps, _render_lines(alias_lines))
 
-    dovecot_lines = "\n".join(
-        f"{m.email}:{m.password_crypt}:5000:5000::/var/mail/vhosts/{m.email.split('@')[1]}/{m.email.split('@')[0]}::userdb_quota_rule=*:storage={m.quota_mb}M"
-        for m in mailboxes
-        if m.is_active
-    ) + "\n"
+    dovecot_lines = _render_lines(
+        [
+            f"{m.email}:{m.password_crypt}:5000:5000::{_maildir_base(m.email.split('@')[1], m.email.split('@')[0])}::userdb_quota_rule=*:storage={m.quota_mb}M"
+            for m in mailboxes
+            if m.is_active
+        ]
+    )
     await executor.write_privileged_file(distro.paths.dovecot_passwd_file, dovecot_lines, mode=0o640)
 
     routes: list[OutboundRouteConfig] = []
@@ -130,12 +188,55 @@ async def _sync_mail_maps(db: AsyncSession) -> None:
     await executor.run_command(["/usr/sbin/postmap", distro.paths.postfix_sasl_passwd])
 
 
+@router.get("/status")
+async def mail_server_status(
+    _: User = Depends(require_permission("mail:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    executor = get_node_executor()
+    distro = get_distro_driver()
+    services: dict[str, str] = {}
+    for service in ("postfix", "dovecot", "opendkim", "rspamd"):
+        try:
+            res = await executor.run_command(distro.build_service_control_cmd(service, "is-active"))
+        except Exception:  # noqa: BLE001 - diagnostics must not crash the endpoint
+            services[service] = "unknown"
+            continue
+        raw = (res.stdout or "").strip()
+        services[service] = raw if raw in SERVICE_STATES else ("active" if res.ok else "inactive")
+
+    domain_count = (await db.execute(select(func.count()).select_from(MailDomain))).scalar_one()
+    mailbox_count = (await db.execute(select(func.count()).select_from(Mailbox))).scalar_one()
+    active_mailbox_count = (
+        await db.execute(select(func.count()).select_from(Mailbox).where(Mailbox.is_active.is_(True)))
+    ).scalar_one()
+    alias_count = (await db.execute(select(func.count()).select_from(MailAlias))).scalar_one()
+
+    return {
+        "hostname": socket.getfqdn(),
+        "public_ip": _detect_server_ip(),
+        "services": services,
+        "counts": {
+            "domains": domain_count,
+            "mailboxes": mailbox_count,
+            "active_mailboxes": active_mailbox_count,
+            "aliases": alias_count,
+        },
+    }
+
+
 @router.get("/domains")
 async def list_mail_domains(
     _: User = Depends(require_permission("mail:read")),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
     domains = (await db.execute(select(MailDomain).order_by(MailDomain.domain))).scalars().all()
+    mailbox_counts = dict(
+        (await db.execute(select(Mailbox.mail_domain_id, func.count()).group_by(Mailbox.mail_domain_id))).all()
+    )
+    alias_counts = dict(
+        (await db.execute(select(MailAlias.mail_domain_id, func.count()).group_by(MailAlias.mail_domain_id))).all()
+    )
     return [
         {
             "id": d.id,
@@ -148,6 +249,8 @@ async def list_mail_domains(
             "relay_username": d.relay_username,
             "relay_password": secret_manager.mask(d.relay_password_encrypted),
             "catchall_address": d.catchall_address,
+            "mailbox_count": mailbox_counts.get(d.id, 0),
+            "alias_count": alias_counts.get(d.id, 0),
         }
         for d in domains
     ]
@@ -181,6 +284,18 @@ async def create_mail_domain(
     return {"id": md.id, "domain": md.domain, "dkim_selector": md.dkim_selector, "dkim_public_key": md.dkim_public_key}
 
 
+def _dns_lookup(qname: str, rtype: str) -> dict[str, Any]:
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = settings.DNS_CHECK_TIMEOUT_SECONDS
+        resolver.lifetime = settings.DNS_CHECK_TIMEOUT_SECONDS
+        answer = resolver.resolve(qname, rtype, raise_on_no_answer=False)
+        values = [r.to_text() for r in answer] if answer.rrset is not None else []
+        return {"propagated": bool(values), "observed": values, "error": None}
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not crash the endpoint
+        return {"propagated": False, "observed": [], "error": str(exc)}
+
+
 @router.get("/domains/{domain_id}/dns-readiness")
 async def inspect_dns_readiness(
     domain_id: int,
@@ -191,46 +306,100 @@ async def inspect_dns_readiness(
     if not md:
         raise HTTPException(status_code=404, detail="Mail domain not found")
 
-    hostname = socket.getfqdn()
+    public_ip = _detect_server_ip()
+    mail_host = _mail_hostname() or f"mail.{md.domain}"
+    spf_value = (
+        f"v=spf1 a mx ip4:{public_ip} ~all"
+        if public_ip and public_ip != "127.0.0.1"
+        else "v=spf1 a mx ~all"
+    )
+    dkim_name = f"{md.dkim_selector}._domainkey"
+    dmarc_value = f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{md.domain}"
+
     required_records = [
-        {"type": "MX", "name": "@", "priority": 10, "value": f"mail.{md.domain}.", "purpose": "Inbound mail routing"},
-        {"type": "TXT", "name": "@", "value": f"v=spf1 a mx ip4:127.0.0.1 ~all", "purpose": "SPF sender policy"},
+        {
+            "type": "MX",
+            "name": "@",
+            "priority": 10,
+            "value": f"{mail_host}.",
+            "purpose": "Inbound mail routing",
+            "fix": f"Add an MX record for @ pointing to {mail_host} with priority 10.",
+        },
+        {
+            "type": "A",
+            "name": mail_host.split(".")[0] if mail_host.endswith(f".{md.domain}") else mail_host,
+            "value": public_ip,
+            "purpose": "Mail host address",
+            "fix": f"Add an A record for {mail_host} pointing to {public_ip}.",
+        },
         {
             "type": "TXT",
-            "name": f"{md.dkim_selector}._domainkey",
+            "name": "@",
+            "value": spf_value,
+            "purpose": "SPF sender policy",
+            "fix": "Publish a single SPF TXT record at @ that authorises this server to send mail.",
+        },
+        {
+            "type": "TXT",
+            "name": dkim_name,
             "value": md.dkim_public_key,
             "purpose": "2048-bit RSA DKIM signature key",
+            "fix": f"Publish the DKIM public key at {dkim_name} as a TXT record.",
         },
         {
             "type": "TXT",
             "name": "_dmarc",
-            "value": f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{md.domain}",
+            "value": dmarc_value,
             "purpose": "DMARC alignment & reporting",
+            "fix": "Publish a DMARC TXT record at _dmarc (start with p=none if unsure).",
         },
     ]
 
     live_checks: dict[str, dict] = {}
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 2.0
-    resolver.lifetime = 2.0
-    for key, qname, rtype in [
-        ("mx", md.domain, "MX"),
-        ("spf", md.domain, "TXT"),
-        ("dkim", f"{md.dkim_selector}._domainkey.{md.domain}", "TXT"),
-        ("dmarc", f"_dmarc.{md.domain}", "TXT"),
-    ]:
-        try:
-            answers = resolver.resolve(qname, rtype)
-            live_checks[key] = {"propagated": True, "observed": [str(r) for r in answers]}
-        except Exception as exc:
-            live_checks[key] = {"propagated": False, "error": str(exc)}
+    if settings.DNS_LIVE_CHECK_ENABLED:
+        mx = _dns_lookup(md.domain, "MX")
+        a = _dns_lookup(mail_host, "A")
+        spf = _dns_lookup(md.domain, "TXT")
+        spf["observed"] = [v for v in spf["observed"] if "v=spf1" in v.lower()]
+        spf["propagated"] = bool(spf["observed"])
+        live_checks = {
+            "mx": mx,
+            "a": a,
+            "spf": spf,
+            "dkim": _dns_lookup(f"{dkim_name}.{md.domain}", "TXT"),
+            "dmarc": _dns_lookup(f"_dmarc.{md.domain}", "TXT"),
+        }
 
     return {
         "domain": md.domain,
-        "mail_host": hostname,
+        "mail_host": mail_host,
+        "public_ip": public_ip,
+        "dkim_selector": md.dkim_selector,
         "required_records": required_records,
+        "live_checks_enabled": settings.DNS_LIVE_CHECK_ENABLED,
         "live_propagation": live_checks,
     }
+
+
+@router.delete("/domains/{domain_id}")
+async def delete_mail_domain(
+    domain_id: int,
+    request: Request,
+    actor: User = Depends(require_permission("mail:delete")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    md = (await db.execute(select(MailDomain).where(MailDomain.id == domain_id))).scalar_one_or_none()
+    if not md:
+        raise HTTPException(status_code=404, detail="Mail domain not found")
+    domain = md.domain
+    await db.delete(md)
+    await db.flush()
+    await _sync_mail_maps(db)
+    await record_audit_event(
+        db, actor=actor, request=request, permission="mail:delete", action="delete_mail_domain", target_resource=f"mail:{domain}"
+    )
+    await db.commit()
+    return {"deleted": True, "domain": domain}
 
 
 @router.put("/domains/{domain_id}/outbound-route")
@@ -269,6 +438,7 @@ async def update_outbound_route(
 @router.get("/diagnostics/egress")
 async def check_direct_egress_diagnostics(_: User = Depends(require_permission("mail:read"))) -> dict:
     hostname = socket.getfqdn()
+    public_ip = _detect_server_ip()
     port25_open = False
     try:
         with socket.create_connection(("gmail-smtp-in.l.google.com", 25), timeout=3):
@@ -278,13 +448,33 @@ async def check_direct_egress_diagnostics(_: User = Depends(require_permission("
 
     ptr_records: list[str] = []
     try:
-        local_ip = socket.gethostbyname(hostname)
-        rev = dns.reversename.from_address(local_ip)
-        ptr_records = [str(r) for r in dns.resolver.resolve(rev, "PTR")]
+        rev = dns.reversename.from_address(public_ip)
+        ptr_records = [str(r).rstrip(".") for r in dns.resolver.resolve(rev, "PTR")]
     except Exception:
         pass
 
-    return {"hostname": hostname, "port_25_egress_reachable": port25_open, "ptr_records": ptr_records}
+    host = hostname.rstrip(".")
+    ptr_matches = any(rec == host for rec in ptr_records)
+    recommendations: list[str] = []
+    if not port25_open:
+        recommendations.append(
+            "Outbound port 25 is blocked by your provider. Use an SMTP relay under Domains → Outbound route."
+        )
+    if not ptr_matches:
+        recommendations.append(
+            f"Set a PTR (reverse DNS) record for {public_ip} to {host or 'this mail hostname'} to improve deliverability."
+        )
+    if not recommendations:
+        recommendations.append("Direct egress looks healthy: port 25 is reachable and PTR matches the hostname.")
+
+    return {
+        "hostname": hostname,
+        "public_ip": public_ip,
+        "port_25_egress_reachable": port25_open,
+        "ptr_records": ptr_records,
+        "ptr_matches_hostname": ptr_matches,
+        "recommendations": recommendations,
+    }
 
 
 @router.get("/mailboxes")
@@ -323,12 +513,52 @@ async def create_mailbox(
     )
     db.add(mbox)
     await db.flush()
+    await _ensure_maildir(md.domain, body.local_part.lower())
     await _sync_mail_maps(db)
     await record_audit_event(
         db, actor=actor, request=request, permission="mail:write", action="create_mailbox", target_resource=f"mailbox:{email}"
     )
     await db.commit()
     return {"id": mbox.id, "email": mbox.email, "quota_mb": mbox.quota_mb}
+
+
+@router.put("/mailboxes/{mailbox_id}")
+async def update_mailbox(
+    mailbox_id: int,
+    body: MailboxUpdate,
+    request: Request,
+    actor: User = Depends(require_permission("mail:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    mbox = (await db.execute(select(Mailbox).where(Mailbox.id == mailbox_id))).scalar_one_or_none()
+    if not mbox:
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+
+    if body.password is not None:
+        mbox.password_crypt = hash_dovecot_sha512_crypt(body.password)
+    if body.quota_mb is not None:
+        mbox.quota_mb = body.quota_mb
+    if body.is_active is not None:
+        mbox.is_active = body.is_active
+
+    await db.flush()
+    await _sync_mail_maps(db)
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="mail:write",
+        action="update_mailbox",
+        target_resource=f"mailbox:{mbox.email}",
+        after_state={"quota_mb": mbox.quota_mb, "is_active": mbox.is_active, "password_rotated": body.password is not None},
+    )
+    await db.commit()
+    return {
+        "id": mbox.id,
+        "email": mbox.email,
+        "quota_mb": mbox.quota_mb,
+        "is_active": mbox.is_active,
+    }
 
 
 @router.delete("/mailboxes/{mailbox_id}")
@@ -386,6 +616,27 @@ async def create_alias(
     return {"id": alias.id, "source_email": alias.source_email, "destination_email": alias.destination_email}
 
 
+@router.delete("/aliases/{alias_id}")
+async def delete_alias(
+    alias_id: int,
+    request: Request,
+    actor: User = Depends(require_permission("mail:delete")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    alias = (await db.execute(select(MailAlias).where(MailAlias.id == alias_id))).scalar_one_or_none()
+    if not alias:
+        raise HTTPException(status_code=404, detail="Alias not found")
+    source_email = alias.source_email
+    await db.delete(alias)
+    await db.flush()
+    await _sync_mail_maps(db)
+    await record_audit_event(
+        db, actor=actor, request=request, permission="mail:delete", action="delete_mail_alias", target_resource=source_email
+    )
+    await db.commit()
+    return {"deleted": True}
+
+
 @router.get("/queue")
 async def get_postfix_queue(_: User = Depends(require_permission("mail:read"))) -> dict:
     executor = get_node_executor()
@@ -397,7 +648,7 @@ async def get_postfix_queue(_: User = Depends(require_permission("mail:read"))) 
                 items.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return {"queue": items, "raw_error": res.stderr if not res.ok else ""}
+    return {"queue": items, "count": len(items), "raw_error": res.stderr if not res.ok else ""}
 
 
 @router.post("/queue/{action}")
@@ -431,11 +682,15 @@ async def read_mail_logs(
     lines: int = Query(default=100, ge=10, le=1000),
     _: User = Depends(require_permission("mail:read")),
 ) -> dict:
-    log_path = Path("/var/log/mail.log")
-    if not log_path.exists():
-        return {"lines": []}
-    content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return {"lines": content[-lines:]}
+    for candidate in (Path("/var/log/mail.log"), Path("/var/log/maillog")):
+        if not candidate.exists():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            return {"lines": [], "source": str(candidate), "error": str(exc)}
+        return {"lines": content[-lines:], "source": str(candidate), "error": None}
+    return {"lines": [], "source": None, "error": "No mail log found at /var/log/mail.log or /var/log/maillog"}
 
 
 class CatchallUpdate(BaseModel):
