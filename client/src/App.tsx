@@ -38,6 +38,7 @@ export default function App() {
           <Route path="terminal" element={<TerminalPage />} />
           <Route path="cron" element={<CronPage />} />
           <Route path="app-store" element={<AppStorePage />} />
+          <Route path="packages" element={<AppStorePage />} />
           <Route path="settings" element={<SettingsPage />} />
         </Route>
       </Routes>

@@ -207,3 +207,61 @@ async def test_firewall_cron_processes_docker_and_trash(client: AsyncClient, adm
     assert batch.status_code == 200
     assert batch.json()["results"][0]["ok"] is True
 
+
+async def test_packages_catalog_and_runtimes(client: AsyncClient, admin_headers: dict[str, str]):
+    # 1. Curated package catalog
+    catalog_res = await client.get("/api/v1/system/packages/catalog", headers=admin_headers)
+    assert catalog_res.status_code == 200
+    catalog = catalog_res.json()
+    assert len(catalog) > 10
+    slugs = [p["slug"] for p in catalog]
+    assert "nginx" in slugs
+    assert "php8.4" in slugs
+    assert "mariadb" in slugs
+    assert "pure-ftpd" in slugs
+
+    # Filter by category
+    php_res = await client.get("/api/v1/system/packages/catalog?category=PHP", headers=admin_headers)
+    assert php_res.status_code == 200
+    assert all(p["category"] == "PHP" for p in php_res.json())
+
+    # 2. PHP runtime detection
+    php_runtimes_res = await client.get("/api/v1/system/runtimes/php", headers=admin_headers)
+    assert php_runtimes_res.status_code == 200
+    runtimes = php_runtimes_res.json()
+    assert any(r["version"] == "8.4" for r in runtimes)
+    assert any(r["version"] == "8.3" for r in runtimes)
+
+    # 3. Curated service control
+    svc_res = await client.post(
+        "/api/v1/system/packages/curated/nginx/control",
+        headers=admin_headers,
+        json={"service": "nginx", "action": "restart"},
+    )
+    assert svc_res.status_code == 200
+    assert svc_res.json()["ok"] is True
+
+    # 4. Curated package install streaming
+    install_res = await client.post(
+        "/api/v1/system/packages/curated/nginx/install",
+        headers=admin_headers,
+    )
+    assert install_res.status_code == 200
+    assert "text/event-stream" in install_res.headers.get("content-type", "")
+
+    # 5. Curated package uninstall streaming
+    uninstall_res = await client.post(
+        "/api/v1/system/packages/curated/nginx/uninstall",
+        headers=admin_headers,
+    )
+    assert uninstall_res.status_code == 200
+    assert "text/event-stream" in uninstall_res.headers.get("content-type", "")
+
+    # 6. Update cache
+    update_res = await client.post(
+        "/api/v1/system/packages/update-cache",
+        headers=admin_headers,
+    )
+    assert update_res.status_code == 200
+    assert "text/event-stream" in update_res.headers.get("content-type", "")
+

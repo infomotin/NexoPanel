@@ -175,12 +175,14 @@
           </select>
         </div>
         <div v-if="newSite.runtime_type === 'php'">
-          <label class="block text-[11px] font-medium text-slate-600 mb-1">PHP Version</label>
+          <div class="flex items-center justify-between mb-1">
+            <label class="block text-[11px] font-medium text-slate-600">PHP Version</label>
+            <NuxtLink to="/packages" class="text-[10px] text-emerald-600 hover:underline">+ Manage Packages</NuxtLink>
+          </div>
           <select v-model="newSite.php_version" class="np-input">
-            <option value="8.5">PHP 8.5</option>
-            <option value="8.4">PHP 8.4</option>
-            <option value="8.3">PHP 8.3</option>
-            <option value="8.2">PHP 8.2</option>
+            <option v-for="php in availablePhpVersions" :key="php.version" :value="php.version">
+              {{ php.label || `PHP ${php.version}` }}
+            </option>
           </select>
         </div>
         <div v-if="newSite.runtime_type === 'proxy'">
@@ -241,12 +243,16 @@
                 <option value="static">Static / Pure HTML</option>
                 <option value="proxy">Reverse Proxy</option>
               </select>
-              <select v-if="editingSite.runtime_type === 'php'" v-model="editingSite.php_version" class="np-input">
-                <option value="8.5">PHP 8.5</option>
-                <option value="8.4">PHP 8.4</option>
-                <option value="8.3">PHP 8.3</option>
-                <option value="8.2">PHP 8.2</option>
-              </select>
+              <div v-if="editingSite.runtime_type === 'php'">
+                <select v-model="editingSite.php_version" class="np-input">
+                  <option v-for="php in availablePhpVersions" :key="php.version" :value="php.version">
+                    {{ php.label || `PHP ${php.version}` }}
+                  </option>
+                </select>
+                <p class="text-[11px] text-slate-500 mt-1">
+                  Need another PHP version? <NuxtLink to="/packages" class="text-emerald-600 underline font-medium">Install PHP versions in Software & Packages</NuxtLink>.
+                </p>
+              </div>
               <input v-if="editingSite.runtime_type === 'proxy'" v-model="editingSite.proxy_upstream" placeholder="http://127.0.0.1:3000" class="np-input" />
             </div>
 
@@ -316,6 +322,12 @@ const aliasesInput = ref('')
 const logsSite = ref<any>(null)
 const siteLogLines = ref<string[]>([])
 
+const availablePhpVersions = ref<any[]>([
+  { version: '8.4', label: 'PHP 8.4' },
+  { version: '8.3', label: 'PHP 8.3' },
+  { version: '8.2', label: 'PHP 8.2' },
+])
+
 const newSite = reactive({ domain: '', runtime_type: 'php', php_version: '8.4', proxy_upstream: '' })
 const newSub = reactive({ website_id: 0, prefix: '' })
 
@@ -347,6 +359,18 @@ async function load() {
   subdomains.value = await apiFetch('/sites/subdomains')
   rewritePresets.value = await apiFetch('/sites/rewrite-presets')
   if (sites.value.length && !newSub.website_id) newSub.website_id = sites.value[0].id
+  try {
+    const runtimes = await apiFetch<any[]>('/system/runtimes/php')
+    if (runtimes && runtimes.length) {
+      availablePhpVersions.value = runtimes
+      const activeOne = runtimes.find((r) => r.is_installed && r.service_status === 'active') || runtimes.find((r) => r.is_installed)
+      if (activeOne) {
+        newSite.php_version = activeOne.version
+      }
+    }
+  } catch {
+    // Keep fallback list
+  }
 }
 
 function openAddModal() {

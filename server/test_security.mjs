@@ -150,3 +150,49 @@ test('FTP Module: full aaPanel parity & security validation', async () => {
   const batchDel = await (await fetch(`${BASE}/ftp/batch-delete`, { method: 'POST', headers, body: JSON.stringify({ ids: [ftpRow.id] }) })).json();
   assert.equal(batchDel.results[0].ok, true);
 });
+
+test('Packages & Runtimes: Curated Software Stacks, PHP Detection & Control', async () => {
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  // 1. Curated package catalog
+  const catalogRes = await fetch(`${BASE}/system/packages/catalog`, { headers });
+  assert.equal(catalogRes.status, 200);
+  const catalog = await catalogRes.json();
+  assert.ok(catalog.length > 5);
+  const slugs = catalog.map((p) => p.slug);
+  assert.ok(slugs.includes('nginx'));
+  assert.ok(slugs.includes('php8.4'));
+  assert.ok(slugs.includes('mariadb'));
+  assert.ok(slugs.includes('pure-ftpd'));
+
+  // 2. Filter by category
+  const phpCatalog = await (await fetch(`${BASE}/system/packages/catalog?category=PHP`, { headers })).json();
+  assert.ok(phpCatalog.every((p) => p.category.toLowerCase() === 'php'));
+
+  // 3. PHP runtime detection
+  const runtimes = await (await fetch(`${BASE}/system/runtimes/php`, { headers })).json();
+  assert.ok(runtimes.some((r) => r.version === '8.4'));
+  assert.ok(runtimes.some((r) => r.version === '8.3'));
+
+  // 4. Curated service control
+  const controlRes = await fetch(`${BASE}/system/packages/curated/nginx/control`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ action: 'restart' }),
+  });
+  assert.equal(controlRes.status, 200);
+  assert.equal((await controlRes.json()).ok, true);
+
+  // 5. Curated install & uninstall streaming endpoints
+  const inst = await fetch(`${BASE}/system/packages/curated/nginx/install`, { method: 'POST', headers });
+  assert.equal(inst.status, 200);
+  assert.ok(inst.headers.get('content-type').includes('text/event-stream'));
+
+  const uninst = await fetch(`${BASE}/system/packages/curated/nginx/uninstall`, { method: 'POST', headers });
+  assert.equal(uninst.status, 200);
+  assert.ok(uninst.headers.get('content-type').includes('text/event-stream'));
+
+  const update = await fetch(`${BASE}/system/packages/update-cache`, { method: 'POST', headers });
+  assert.equal(update.status, 200);
+  assert.ok(update.headers.get('content-type').includes('text/event-stream'));
+});

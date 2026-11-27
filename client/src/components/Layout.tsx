@@ -19,6 +19,7 @@ const navItems = [
   { to: '/terminal', label: 'Terminal', icon: Terminal },
   { to: '/cron', label: 'Cron', icon: Clock },
   { to: '/app-store', label: 'App Store', icon: Store },
+  { to: '/packages', label: 'Packages', icon: Store },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 

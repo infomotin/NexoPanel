@@ -717,6 +717,137 @@ app.post('/api/apps/:id/home-toggle', requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM software_apps WHERE id = ?').get(appRow.id));
 });
 
+// --- System Packages & Curated Stack Catalog ---
+const CURATED_PACKAGES_MOCK = [
+  { slug: 'nginx', name: 'Nginx Web Server', category: 'Web Server', description: 'High performance asynchronous HTTP server and reverse proxy.', apt_packages: ['nginx'], service: 'nginx', icon: 'globe', is_installed: true, version: '1.24.0', service_status: 'active' },
+  { slug: 'apache2', name: 'Apache HTTP Server', category: 'Web Server', description: 'Traditional Apache2 web server with modular architecture.', apt_packages: ['apache2'], service: 'apache2', icon: 'globe', is_installed: false, version: null, service_status: 'none' },
+  { slug: 'php8.4', name: 'PHP 8.4 (FPM)', category: 'PHP', description: 'Latest PHP 8.4 runtime with PHP-FPM and standard extensions.', apt_packages: ['php8.4-fpm', 'php8.4-cli', 'php8.4-mysql', 'php8.4-curl'], service: 'php8.4-fpm', icon: 'file-code', is_installed: true, version: '8.4.1', service_status: 'active' },
+  { slug: 'php8.3', name: 'PHP 8.3 (FPM)', category: 'PHP', description: 'Production PHP 8.3 runtime with PHP-FPM and standard web extensions.', apt_packages: ['php8.3-fpm', 'php8.3-cli', 'php8.3-mysql'], service: 'php8.3-fpm', icon: 'file-code', is_installed: true, version: '8.3.6', service_status: 'active' },
+  { slug: 'php8.2', name: 'PHP 8.2 (FPM)', category: 'PHP', description: 'Ubuntu LTS default PHP 8.2 runtime with PHP-FPM.', apt_packages: ['php8.2-fpm', 'php8.2-cli'], service: 'php8.2-fpm', icon: 'file-code', is_installed: true, version: '8.2.18', service_status: 'active' },
+  { slug: 'php8.1', name: 'PHP 8.1 (FPM)', category: 'PHP', description: 'PHP 8.1 runtime for legacy applications.', apt_packages: ['php8.1-fpm', 'php8.1-cli'], service: 'php8.1-fpm', icon: 'file-code', is_installed: false, version: null, service_status: 'none' },
+  { slug: 'mariadb', name: 'MariaDB Server', category: 'Database', description: 'High-performance drop-in replacement for MySQL relational database server.', apt_packages: ['mariadb-server', 'mariadb-client'], service: 'mariadb', icon: 'database', is_installed: true, version: '10.11.8', service_status: 'active' },
+  { slug: 'postgresql', name: 'PostgreSQL', category: 'Database', description: 'Advanced open-source object-relational database management system.', apt_packages: ['postgresql'], service: 'postgresql', icon: 'database', is_installed: false, version: null, service_status: 'none' },
+  { slug: 'redis', name: 'Redis In-Memory Cache', category: 'Database', description: 'In-memory data structure store used as a database, cache, and message broker.', apt_packages: ['redis-server'], service: 'redis-server', icon: 'database', is_installed: true, version: '7.0.15', service_status: 'active' },
+  { slug: 'memcached', name: 'Memcached Object Store', category: 'Database', description: 'Distributed memory caching system.', apt_packages: ['memcached'], service: 'memcached', icon: 'database', is_installed: false, version: null, service_status: 'none' },
+  { slug: 'pure-ftpd', name: 'Pure-FTPd Server', category: 'FTP', description: 'Production-grade secure FTP daemon with virtual database auth and TLS encryption.', apt_packages: ['pure-ftpd'], service: 'pure-ftpd', icon: 'hard-drive', is_installed: true, version: '1.0.51', service_status: 'active' },
+  { slug: 'nodejs', name: 'Node.js & NPM', category: 'Runtime', description: 'Event-driven JavaScript runtime and package manager.', apt_packages: ['nodejs', 'npm'], service: null, icon: 'cpu', is_installed: true, version: '20.12.2', service_status: 'none' },
+  { slug: 'python3', name: 'Python 3 & venv', category: 'Runtime', description: 'Python 3 programming environment with pip package installer.', apt_packages: ['python3', 'python3-pip'], service: null, icon: 'cpu', is_installed: true, version: '3.12.3', service_status: 'none' },
+  { slug: 'composer', name: 'Composer PHP Manager', category: 'Tools', description: 'Standard dependency manager for PHP projects.', apt_packages: ['composer'], service: null, icon: 'tool', is_installed: true, version: '2.7.2', service_status: 'none' },
+  { slug: 'docker', name: 'Docker Engine', category: 'Tools', description: 'Container runtime platform.', apt_packages: ['docker.io'], service: 'docker', icon: 'container', is_installed: true, version: '24.0.7', service_status: 'active' },
+  { slug: 'ufw', name: 'UFW Firewall', category: 'Security', description: 'Host-based packet filtering firewall configuration tool.', apt_packages: ['ufw'], service: 'ufw', icon: 'flame', is_installed: true, version: '0.36.2', service_status: 'active' },
+  { slug: 'fail2ban', name: 'Fail2ban Defense', category: 'Security', description: 'Intrusion prevention analyzing auth logs.', apt_packages: ['fail2ban'], service: 'fail2ban', icon: 'shield', is_installed: true, version: '1.0.2', service_status: 'active' },
+  { slug: 'certbot', name: 'Certbot (Let\'s Encrypt)', category: 'Security', description: 'Automated ACME client for issuing free SSL/TLS certificates.', apt_packages: ['certbot'], service: null, icon: 'key', is_installed: true, version: '2.9.0', service_status: 'none' },
+  { slug: 'git', name: 'Git SCM', category: 'Tools', description: 'Fast distributed version control system.', apt_packages: ['git'], service: null, icon: 'tool', is_installed: true, version: '2.43.0', service_status: 'none' },
+];
+
+app.get(['/api/system/packages/catalog', '/api/v1/system/packages/catalog'], requireAuth, (req, res) => {
+  const category = String(req.query.category || 'ALL');
+  const search = String(req.query.search || '').toLowerCase();
+  const filtered = CURATED_PACKAGES_MOCK.filter((p) => {
+    if (category === 'Installed' && !p.is_installed) return false;
+    if (category !== 'ALL' && category !== 'Installed' && p.category.toLowerCase() !== category.toLowerCase()) return false;
+    if (search && !p.name.toLowerCase().includes(search) && !p.slug.toLowerCase().includes(search)) return false;
+    return true;
+  });
+  res.json(filtered);
+});
+
+app.get(['/api/system/runtimes/php', '/api/v1/system/runtimes/php'], requireAuth, (req, res) => {
+  const runtimes = [
+    { version: '8.4', is_installed: true, socket: '/run/php/php8.4-fpm.sock', service_status: 'active', label: 'PHP 8.4 (Running)' },
+    { version: '8.3', is_installed: true, socket: '/run/php/php8.3-fpm.sock', service_status: 'active', label: 'PHP 8.3 (Running)' },
+    { version: '8.2', is_installed: true, socket: '/run/php/php8.2-fpm.sock', service_status: 'active', label: 'PHP 8.2 (Running)' },
+    { version: '8.1', is_installed: false, socket: '/run/php/php8.1-fpm.sock', service_status: 'inactive', label: 'PHP 8.1 (Not Installed)' },
+    { version: '7.4', is_installed: false, socket: '/run/php/php7.4-fpm.sock', service_status: 'inactive', label: 'PHP 7.4 (Not Installed)' },
+  ];
+  res.json(runtimes);
+});
+
+app.post(['/api/system/packages/curated/:slug/control', '/api/v1/system/packages/curated/:slug/control'], requireAuth, (req, res) => {
+  const pkg = CURATED_PACKAGES_MOCK.find((p) => p.slug === req.params.slug);
+  if (!pkg || !pkg.service) return res.status(400).json({ error: 'Package has no associated service' });
+  const action = req.body?.action || 'restart';
+  if (action === 'stop') pkg.service_status = 'inactive';
+  else pkg.service_status = 'active';
+  res.json({ ok: true, stdout: `Service ${pkg.service} ${action} successful`, stderr: '' });
+});
+
+app.post(['/api/system/packages/curated/:slug/install', '/api/v1/system/packages/curated/:slug/install'], requireAuth, (req, res) => {
+  const pkg = CURATED_PACKAGES_MOCK.find((p) => p.slug === req.params.slug);
+  if (!pkg) return res.status(404).json({ error: 'Package not found' });
+  pkg.is_installed = true;
+  if (pkg.service) pkg.service_status = 'active';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify({ line: `=== Installing ${pkg.name} ===` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: `apt-get install -y ${pkg.apt_packages.join(' ')}` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: 'Setting up packages...' })}\n\n`);
+  if (pkg.service) {
+    res.write(`data: ${JSON.stringify({ line: `Enabling systemd service: ${pkg.service}...` })}\n\n`);
+    res.write(`data: ${JSON.stringify({ line: `✓ Service ${pkg.service} is running.` })}\n\n`);
+  }
+  res.write(`data: ${JSON.stringify({ line: `🎉 ${pkg.name} installation complete!` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ done: true, returncode: 0 })}\n\n`);
+  res.end();
+});
+
+app.post(['/api/system/packages/curated/:slug/uninstall', '/api/v1/system/packages/curated/:slug/uninstall'], requireAuth, (req, res) => {
+  const pkg = CURATED_PACKAGES_MOCK.find((p) => p.slug === req.params.slug);
+  if (!pkg) return res.status(404).json({ error: 'Package not found' });
+  pkg.is_installed = false;
+  pkg.service_status = 'none';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify({ line: `=== Removing ${pkg.name} ===` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: `apt-get remove -y ${pkg.apt_packages.join(' ')}` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: `✓ ${pkg.name} removed.` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ done: true, returncode: 0 })}\n\n`);
+  res.end();
+});
+
+app.post(['/api/system/packages/update-cache', '/api/v1/system/packages/update-cache'], requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify({ line: '=== Updating APT Index (apt-get update) ===' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: 'Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: '✓ Package lists updated successfully.' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ done: true, returncode: 0 })}\n\n`);
+  res.end();
+});
+
+app.get(['/api/system/packages', '/api/v1/system/packages'], requireAuth, (req, res) => {
+  const search = String(req.query.search || '').toLowerCase();
+  const allPkgs = [
+    { name: 'nginx', version: '1.24.0-2ubuntu7', status: 'install ok installed' },
+    { name: 'php8.4-fpm', version: '8.4.1-1+ubuntu24.04', status: 'install ok installed' },
+    { name: 'php8.3-fpm', version: '8.3.6-0ubuntu0.24.04.1', status: 'install ok installed' },
+    { name: 'php8.2-fpm', version: '8.2.18-1ubuntu0.24.04.1', status: 'install ok installed' },
+    { name: 'mariadb-server', version: '1:10.11.8-0ubuntu0.24.04.1', status: 'install ok installed' },
+    { name: 'redis-server', version: '5:7.0.15-1ubuntu0.24.04.1', status: 'install ok installed' },
+    { name: 'pure-ftpd', version: '1.0.51-1', status: 'install ok installed' },
+    { name: 'ufw', version: '0.36.2-1', status: 'install ok installed' },
+    { name: 'fail2ban', version: '1.0.2-3', status: 'install ok installed' },
+    { name: 'docker.io', version: '24.0.7-0ubuntu4.1', status: 'install ok installed' },
+  ];
+  const packages = allPkgs.filter((p) => !search || p.name.includes(search));
+  res.json({ packages });
+});
+
+app.post(['/api/system/packages/:action', '/api/v1/system/packages/:action'], requireAuth, (req, res) => {
+  const action = req.params.action;
+  const packages = Array.isArray(req.body?.packages) ? req.body.packages : [];
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify({ line: `Running apt-get ${action} ${packages.join(' ')}...` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ line: `✓ Done ${action} on ${packages.join(', ')}` })}\n\n`);
+  res.write(`data: ${JSON.stringify({ done: true, returncode: 0 })}\n\n`);
+  res.end();
+});
+
 // --- 10. System Monitor (Historical Data) ---
 app.get('/api/monitor/history', requireAuth, (req, res) => {
   const range = String(req.query.range || 'today');
