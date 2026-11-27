@@ -1,22 +1,21 @@
 """Backup & Disaster Recovery Engine API router."""
 from __future__ import annotations
 
-import tarfile
-from datetime import datetime, timezone
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import record_audit_event
-from app.core.config import settings
 from app.core.rbac import require_permission
-from app.db.models import BackupJob, BackupManifest, User
+from app.db.models import BackupJob, BackupManifest, ManagedDatabase, User
 from app.db.session import get_db
-from app.drivers.storage import LocalDiskStorageBackend
-from app.services.executor import get_node_executor
+from app.services.backups import (
+    UnsafeBackupArchive,
+    create_backup_archive,
+    restore_backup_archive,
+    store_backup_archive,
+)
 
 router = APIRouter(prefix="/backups", tags=["Backup & Disaster Recovery"])
 
@@ -109,37 +108,27 @@ async def run_manual_backup(
     actor: User = Depends(require_permission("backups:write")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    backend = LocalDiskStorageBackend(settings.BACKUP_DIR)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    filename = f"{body.target_type}_{body.target_identifier.replace('/', '_')}_{ts}.tar.gz"
-    staging_path = settings.BACKUP_DIR / filename
-    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = "mariadb"
+    if body.target_type == "database":
+        record = (
+            await db.execute(select(ManagedDatabase).where(ManagedDatabase.db_name == body.target_identifier))
+        ).scalar_one_or_none()
+        if record:
+            engine = record.engine
 
-    if body.target_type == "website":
-        src_dir = settings.WEB_ROOT_BASE / body.target_identifier
-        with tarfile.open(staging_path, "w:gz") as tf:
-            if src_dir.exists():
-                tf.add(src_dir, arcname=body.target_identifier)
-    elif body.target_type == "mail":
-        src_dir = settings.MAIL_DIR_BASE / body.target_identifier
-        with tarfile.open(staging_path, "w:gz") as tf:
-            if src_dir.exists():
-                tf.add(src_dir, arcname=body.target_identifier)
-    else:
-        executor = get_node_executor()
-        sql_out = await executor.run_command(["/usr/bin/mariadb-dump", body.target_identifier])
-        dump_file = settings.BACKUP_DIR / f"{body.target_identifier}_{ts}.sql"
-        dump_file.write_text(sql_out.stdout, encoding="utf-8")
-        with tarfile.open(staging_path, "w:gz") as tf:
-            tf.add(dump_file, arcname=dump_file.name)
-        dump_file.unlink(missing_ok=True)
+    try:
+        staging_path = await create_backup_archive(
+            body.target_type, body.target_identifier, engine=engine
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    stored_uri, size_bytes, checksum = await backend.store(staging_path, filename)
+    stored_uri, size_bytes, checksum = await store_backup_archive(staging_path)
     manifest = BackupManifest(
         job_id=body.job_id,
         target_type=body.target_type,
         target_identifier=body.target_identifier,
-        storage_backend=backend.backend_name,
+        storage_backend="local",
         artifact_path=stored_uri,
         size_bytes=size_bytes,
         checksum_sha256=checksum,
@@ -170,16 +159,25 @@ async def restore_backup(
     if not manifest:
         raise HTTPException(status_code=404, detail="Backup manifest not found")
 
-    backend = LocalDiskStorageBackend(settings.BACKUP_DIR)
-    tmp_archive = settings.BACKUP_DIR / f"restore_{manifest.id}.tar.gz"
-    await backend.retrieve(manifest.artifact_path, tmp_archive)
-    if manifest.target_type == "website":
-        with tarfile.open(tmp_archive, "r:gz") as tf:
-            tf.extractall(settings.WEB_ROOT_BASE)
-    elif manifest.target_type == "mail":
-        with tarfile.open(tmp_archive, "r:gz") as tf:
-            tf.extractall(settings.MAIL_DIR_BASE)
-    tmp_archive.unlink(missing_ok=True)
+    engine = "mariadb"
+    if manifest.target_type == "database":
+        record = (
+            await db.execute(select(ManagedDatabase).where(ManagedDatabase.db_name == manifest.target_identifier))
+        ).scalar_one_or_none()
+        if record:
+            engine = record.engine
+
+    try:
+        summary = await restore_backup_archive(
+            target_type=manifest.target_type,
+            target_identifier=manifest.target_identifier,
+            artifact_path=manifest.artifact_path,
+            engine=engine,
+        )
+    except UnsafeBackupArchive as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     await record_audit_event(
         db,
@@ -190,4 +188,4 @@ async def restore_backup(
         target_resource=f"backup_manifest:{manifest.id}",
     )
     await db.commit()
-    return {"restored": True, "manifest_id": manifest.id}
+    return {"restored": True, "manifest_id": manifest.id, "detail": summary}

@@ -32,6 +32,10 @@ from urllib.parse import urlparse
 
 SOCKET_PATH = Path(os.environ.get("NEXOPANEL_DAEMON_SOCKET_PATH", "/run/nexopanel/daemon.sock"))
 
+# SQL dumps are streamed to the database client on stdin, so a single request
+# line can legitimately be large (up to this cap) rather than the 64 KiB default.
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
+
 ALLOWED_BINARIES: set[str] = {
     "/usr/sbin/nginx",
     "/bin/systemctl",
@@ -919,7 +923,9 @@ async def main() -> None:
     # Bind with a restrictive umask so the socket is never briefly world-readable.
     previous_umask = os.umask(0o077)
     try:
-        server = await asyncio.start_unix_server(client_connected, path=str(SOCKET_PATH))
+        server = await asyncio.start_unix_server(
+            client_connected, path=str(SOCKET_PATH), limit=MAX_REQUEST_BYTES
+        )
     finally:
         os.umask(previous_umask)
     os.chmod(SOCKET_PATH, 0o600)

@@ -32,7 +32,9 @@ class NodeExecutor(ABC):
         self.node_id = node_id
 
     @abstractmethod
-    async def run_command(self, args: list[str], timeout: int = 120) -> ExecutionResult: ...
+    async def run_command(
+        self, args: list[str], timeout: int = 120, stdin: str | None = None
+    ) -> ExecutionResult: ...
 
     @abstractmethod
     async def write_privileged_file(self, path: str, content: str, mode: int = 0o644) -> ExecutionResult: ...
@@ -122,12 +124,17 @@ class LocalNodeExecutor(NodeExecutor):
         # Fallback to direct non-shell subprocess if running in single-user dev mode
         if payload.get("op") == "exec":
             args: list[str] = payload["args"]
+            stdin_data = payload.get("stdin")
             proc = await asyncio.create_subprocess_exec(
                 *args,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(input=stdin_data.encode("utf-8") if stdin_data is not None else None),
+                timeout=timeout,
+            )
             return ExecutionResult(
                 returncode=proc.returncode or 0,
                 stdout=out_b.decode("utf-8", errors="replace"),
@@ -135,8 +142,13 @@ class LocalNodeExecutor(NodeExecutor):
             )
         return ExecutionResult(returncode=1, stdout="", stderr="Privileged daemon socket unavailable")
 
-    async def run_command(self, args: list[str], timeout: int = 120) -> ExecutionResult:
-        return await self._send_daemon_request({"op": "exec", "args": args, "timeout": timeout}, timeout=timeout)
+    async def run_command(
+        self, args: list[str], timeout: int = 120, stdin: str | None = None
+    ) -> ExecutionResult:
+        payload: dict[str, Any] = {"op": "exec", "args": args, "timeout": timeout}
+        if stdin is not None:
+            payload["stdin"] = stdin
+        return await self._send_daemon_request(payload, timeout=timeout)
 
     async def write_privileged_file(self, path: str, content: str, mode: int = 0o644) -> ExecutionResult:
         if self.use_mock:
