@@ -69,6 +69,10 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/cmake",
     "/usr/bin/python3",
     "/usr/bin/which",
+    "/bin/sync",
+    "/usr/bin/sync",
+    "/bin/journalctl",
+    "/usr/bin/journalctl",
 }
 
 ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
@@ -81,6 +85,17 @@ ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "/var/www/",
     "/var/mail/vhosts/",
     "/var/backups/nexopanel/",
+)
+
+ALLOWED_LOG_PREFIXES: tuple[str, ...] = (
+    "/var/log/",
+    "/var/log/nginx/",
+    "/var/log/mysql/",
+    "/var/log/mariadb/",
+    "/var/log/postgresql/",
+    "/var/log/nexopanel/",
+    "/var/log/mail/",
+    "/var/log/fail2ban/",
 )
 
 # Root-only scratch directory is no longer needed: the control plane performs
@@ -144,6 +159,9 @@ DB_CLIENT_FLAGS = {
     "-N",
     "-s",
     "-A",
+    "-B",
+    "-F",
+    "-W",
     "-t",
     "--batch",
     "--skip-column-names",
@@ -382,6 +400,9 @@ def _validate_db_client(args: list[str], *, allow_sql: bool = True) -> str | Non
     for arg in args:
         if skip_next:
             skip_next = False
+            if value_flag == "-F":
+                # Delimiter can be single character or escaped tab/comma
+                continue
             if value_flag is not None and not DB_IDENTIFIER_RE.match(arg):
                 return f"Invalid database identifier: {arg}"
             continue
@@ -391,7 +412,7 @@ def _validate_db_client(args: list[str], *, allow_sql: bool = True) -> str | Non
             skip_next = True
             value_flag = None
             continue
-        if arg in {"-U", "--username", "-d", "--dbname"}:
+        if arg in {"-U", "--username", "-d", "--dbname", "-F"}:
             skip_next = True
             value_flag = arg
             continue
@@ -579,6 +600,53 @@ def _validate_which(args: list[str]) -> str | None:
     return None
 
 
+def _validate_journalctl(args: list[str]) -> str | None:
+    for arg in args:
+        if arg in ("--no-pager", "-f", "-q", "-e"):
+            continue
+        if arg.startswith("-u") or arg.startswith("-n") or arg.startswith("--unit=") or arg.startswith("--lines="):
+            continue
+        if re.match(r"^[0-9]+$", arg) or SERVICE_UNIT_RE.match(arg):
+            continue
+        return f"Unsupported journalctl argument: {arg}"
+    return None
+
+
+def _tail_log_file(p: Path, max_lines: int = 100, filter_text: str | None = None) -> list[str]:
+    """Read last N lines from a file efficiently."""
+    chunk_size = 64 * 1024
+    lines: list[str] = []
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            buffer = bytearray()
+            pos = file_size
+            while pos > 0 and buffer.count(b"\n") < max_lines * 2:
+                read_len = min(pos, chunk_size)
+                pos -= read_len
+                f.seek(pos)
+                chunk = f.read(read_len)
+                buffer = chunk + buffer
+            decoded = buffer.decode("utf-8", errors="replace")
+            all_lines = decoded.splitlines()
+            if filter_text:
+                q = filter_text.lower()
+                all_lines = [l for l in all_lines if q in l.lower()]
+            lines = all_lines[-max_lines:] if len(all_lines) > max_lines else all_lines
+    except Exception:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = [l.rstrip("\r\n") for l in f]
+                if filter_text:
+                    q = filter_text.lower()
+                    all_lines = [l for l in all_lines if q in l.lower()]
+                lines = all_lines[-max_lines:]
+        except Exception:
+            lines = []
+    return lines
+
+
 _EXEC_VALIDATORS = {
     "/bin/systemctl": _validate_systemctl,
     "/usr/bin/systemctl": _validate_systemctl,
@@ -612,6 +680,10 @@ _EXEC_VALIDATORS = {
     "/usr/bin/cmake": _validate_cmake,
     "/usr/bin/python3": _validate_python3,
     "/usr/bin/which": _validate_which,
+    "/bin/sync": lambda args: None,
+    "/usr/bin/sync": lambda args: None,
+    "/bin/journalctl": _validate_journalctl,
+    "/usr/bin/journalctl": _validate_journalctl,
 }
 
 
@@ -1055,6 +1127,47 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
             return {"returncode": 1, "stdout": "", "stderr": f"Install failed: {exc.strerror or exc}"}
         _ensure_owner_accessible(dst, owner, group)
         return {"returncode": 0, "stdout": "installed", "stderr": ""}
+
+    if op == "read_log_file":
+        path_str = str(payload.get("path", ""))
+        lines_count = min(int(payload.get("lines", 100)), 2000)
+        filter_text = payload.get("filter")
+        if not _is_allowed_path(path_str, ALLOWED_LOG_PREFIXES):
+            return {"returncode": 1, "stdout": "", "stderr": f"Log path not permitted: {path_str}"}
+        p = Path(path_str)
+        if not p.exists() or not p.is_file():
+            return {"returncode": 1, "stdout": "", "stderr": f"Log file not found: {path_str}"}
+        lines = _tail_log_file(p, lines_count, filter_text)
+        return {
+            "returncode": 0,
+            "stdout": "\n".join(lines),
+            "stderr": "",
+            "file_size": p.stat().st_size,
+            "last_modified": p.stat().st_mtime,
+        }
+
+    if op == "clear_log_file":
+        path_str = str(payload.get("path", ""))
+        if not _is_allowed_path(path_str, ALLOWED_LOG_PREFIXES):
+            return {"returncode": 1, "stdout": "", "stderr": f"Log path not permitted: {path_str}"}
+        p = Path(path_str)
+        if not p.exists() or not p.is_file():
+            return {"returncode": 1, "stdout": "", "stderr": f"Log file not found: {path_str}"}
+        try:
+            p.write_text("", encoding="utf-8")
+            return {"returncode": 0, "stdout": "cleared", "stderr": ""}
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Clear failed: {exc}"}
+
+    if op == "drop_caches":
+        try:
+            subprocess.run(["/bin/sync"], check=False)
+            drop_path = Path("/proc/sys/vm/drop_caches")
+            if drop_path.exists():
+                drop_path.write_text("3\n")
+            return {"returncode": 0, "stdout": "caches dropped", "stderr": ""}
+        except Exception as exc:
+            return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
     return {"returncode": 1, "stdout": "", "stderr": f"Unknown operation: {op}"}
 

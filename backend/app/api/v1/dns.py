@@ -43,6 +43,7 @@ class DnsZoneCreate(BaseModel):
     primary_ns: str = "ns1.localhost.localdomain"
     secondary_ns: str | None = None
     admin_email: str = "hostmaster.localhost.localdomain"
+    create_default_records: bool = True
 
     @field_validator("domain")
     @classmethod
@@ -288,18 +289,47 @@ async def create_zone(
     serial = _next_serial(0)
     p_ns = body.primary_ns.rstrip(".")
     s_ns = body.secondary_ns.rstrip(".") if body.secondary_ns else None
+
+    # Clean admin email; if placeholder localhost is present, default to hostmaster.<domain>
+    admin_email = body.admin_email
+    if not admin_email or "localhost.localdomain" in admin_email:
+        admin_email = f"hostmaster.{body.domain}"
+
     zone = DnsZone(
         domain=body.domain,
         primary_ns=p_ns,
-        admin_email=body.admin_email,
+        admin_email=admin_email,
         serial=serial,
     )
     db.add(zone)
     await db.flush()
+
+    # Authoritative NS records
     default_ns = DnsRecord(zone_id=zone.id, name="@", record_type="NS", value=f"{p_ns}.", ttl=3600)
     db.add(default_ns)
     if s_ns and s_ns != p_ns:
         db.add(DnsRecord(zone_id=zone.id, name="@", record_type="NS", value=f"{s_ns}.", ttl=3600))
+
+    # Standard default records (@ A, www A, mail A, ftp A, MX, SPF)
+    if body.create_default_records:
+        server_ip = await _get_setting(db, "dns_public_ip") or _detect_server_ip()
+        if server_ip and server_ip != "127.0.0.1":
+            # Apex and standard service subdomains
+            db.add(DnsRecord(zone_id=zone.id, name="@", record_type="A", value=server_ip, ttl=3600))
+            db.add(DnsRecord(zone_id=zone.id, name="www", record_type="A", value=server_ip, ttl=3600))
+            db.add(DnsRecord(zone_id=zone.id, name="mail", record_type="A", value=server_ip, ttl=3600))
+            db.add(DnsRecord(zone_id=zone.id, name="ftp", record_type="A", value=server_ip, ttl=3600))
+            db.add(DnsRecord(zone_id=zone.id, name="@", record_type="MX", value=f"mail.{body.domain}.", priority=10, ttl=3600))
+            db.add(DnsRecord(zone_id=zone.id, name="@", record_type="TXT", value='"v=spf1 a mx ~all"', ttl=3600))
+
+            # In-zone glue records if nameservers are under this domain (e.g. ns1.alaqsamadrasah.com)
+            if p_ns.lower().endswith(f".{body.domain.lower()}") or p_ns.lower() == body.domain.lower():
+                ns_prefix = p_ns[:-len(body.domain)-1] if "." in p_ns else "ns1"
+                db.add(DnsRecord(zone_id=zone.id, name=ns_prefix, record_type="A", value=server_ip, ttl=3600))
+            if s_ns and (s_ns.lower().endswith(f".{body.domain.lower()}") or s_ns.lower() == body.domain.lower()):
+                ns_prefix = s_ns[:-len(body.domain)-1] if "." in s_ns else "ns2"
+                db.add(DnsRecord(zone_id=zone.id, name=ns_prefix, record_type="A", value=server_ip, ttl=3600))
+
     await db.flush()
 
     zone_records = (await db.execute(select(DnsRecord).where(DnsRecord.zone_id == zone.id))).scalars().all()

@@ -668,3 +668,179 @@ async def execute_sql_query(
         "stderr": res.stderr,
         "elapsed_ms": elapsed_ms,
     }
+
+
+# --- Active Database Query Inspector & Processlist Monitoring ---
+
+class KillQueryRequest(BaseModel):
+    engine: str = Field(default="mariadb", pattern="^(mariadb|postgresql)$")
+    process_id: int = Field(ge=1)
+
+
+@router.get("/queries/active")
+async def get_active_queries(
+    engine: str = Query(default="mariadb", pattern="^(mariadb|postgresql)$"),
+    _: User = Depends(require_permission("databases:read")),
+) -> dict[str, Any]:
+    """Retrieve running queries, connection threads, and processlist for the selected database engine."""
+    executor = get_node_executor()
+    queries: list[dict[str, Any]] = []
+    stats: dict[str, Any] = {
+        "threads_running": 0,
+        "threads_connected": 0,
+        "slow_queries": 0,
+        "uptime_seconds": 0,
+        "total_queries": 0,
+    }
+
+    if engine == "mariadb":
+        # 1. Fetch Global Status
+        status_res = await executor.run_command([
+            "/usr/bin/mariadb", "-B", "-e",
+            "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_running', 'Threads_connected', 'Slow_queries', 'Uptime', 'Questions');"
+        ])
+        if status_res.ok and status_res.stdout.strip():
+            for line in status_res.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 2:
+                    k, v = parts[0].strip(), parts[1].strip()
+                    if k == "Threads_running" and v.isdigit():
+                        stats["threads_running"] = int(v)
+                    elif k == "Threads_connected" and v.isdigit():
+                        stats["threads_connected"] = int(v)
+                    elif k == "Slow_queries" and v.isdigit():
+                        stats["slow_queries"] = int(v)
+                    elif k == "Uptime" and v.isdigit():
+                        stats["uptime_seconds"] = int(v)
+                    elif k == "Questions" and v.isdigit():
+                        stats["total_queries"] = int(v)
+
+        # 2. Fetch Processlist
+        plist_res = await executor.run_command([
+            "/usr/bin/mariadb", "-B", "-e", "SHOW FULL PROCESSLIST;"
+        ])
+        if plist_res.ok and plist_res.stdout.strip():
+            lines = plist_res.stdout.splitlines()
+            if len(lines) > 1:
+                # header: Id User Host db Command Time State Info
+                for line in lines[1:]:
+                    cols = line.split("\t")
+                    if len(cols) >= 8:
+                        pid_str, user, host, db_name, command, time_sec_str, state, info = cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
+                        # Filter out internal sleep threads or self check queries
+                        if command == "Binlog Dump":
+                            continue
+                        t_sec = int(time_sec_str) if time_sec_str.isdigit() else 0
+                        queries.append({
+                            "id": int(pid_str) if pid_str.isdigit() else 0,
+                            "user": user,
+                            "host": host,
+                            "database": db_name if db_name and db_name != "NULL" else "(none)",
+                            "command": command,
+                            "time_seconds": t_sec,
+                            "state": state if state and state != "NULL" else "",
+                            "query": info if info and info != "NULL" else "",
+                            "is_slow": t_sec >= 2,
+                            "engine": "mariadb",
+                        })
+
+    else:
+        # PostgreSQL Activity
+        pg_res = await executor.run_command([
+            "/usr/bin/psql", "-U", "postgres", "-A", "-F", "\t", "-c",
+            "SELECT pid, usename, datname, COALESCE(client_addr::text, 'local'), state, COALESCE(EXTRACT(EPOCH FROM (now() - query_start))::int, 0) as duration, query, COALESCE(wait_event, '') FROM pg_stat_activity WHERE state != 'idle' AND pid <> pg_backend_pid();"
+        ])
+        if pg_res.ok and pg_res.stdout.strip():
+            lines = [l for l in pg_res.stdout.splitlines() if not (l.startswith("(") and l.endswith(")"))]
+            if len(lines) > 1:
+                for line in lines[1:]:
+                    cols = line.split("\t")
+                    if len(cols) >= 8:
+                        pid_str, user, db_name, host, state, dur_str, query_text, wait_evt = cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
+                        t_sec = int(dur_str) if dur_str.isdigit() else 0
+                        queries.append({
+                            "id": int(pid_str) if pid_str.isdigit() else 0,
+                            "user": user,
+                            "host": host,
+                            "database": db_name,
+                            "command": state,
+                            "time_seconds": t_sec,
+                            "state": wait_evt or state,
+                            "query": query_text,
+                            "is_slow": t_sec >= 2,
+                            "engine": "postgresql",
+                        })
+        stats["threads_running"] = len(queries)
+        stats["threads_connected"] = len(queries)
+
+    # Sort queries so longest-running appears first
+    queries.sort(key=lambda q: q["time_seconds"], reverse=True)
+    return {
+        "engine": engine,
+        "stats": stats,
+        "total_active": len(queries),
+        "queries": queries,
+    }
+
+
+@router.post("/queries/kill")
+async def kill_active_query(
+    body: KillQueryRequest,
+    request: Request,
+    actor: User = Depends(require_permission("databases:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Terminate / kill a runaway or blocking query thread."""
+    executor = get_node_executor()
+    if body.engine == "mariadb":
+        res = await executor.run_command(["/usr/bin/mariadb", "-B", "-e", f"KILL {body.process_id};"])
+    else:
+        res = await executor.run_command(["/usr/bin/psql", "-U", "postgres", "-A", "-c", f"SELECT pg_terminate_backend({body.process_id});"])
+
+    if not res.ok:
+        raise HTTPException(status_code=500, detail=f"Failed to kill query process: {res.stderr or res.stdout}")
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="databases:write",
+        action="kill_database_query",
+        target_resource=f"{body.engine}:{body.process_id}",
+    )
+    await db.commit()
+    return {"ok": True, "engine": body.engine, "process_id": body.process_id}
+
+
+@router.get("/queries/summary")
+async def get_queries_summary(
+    _: User = Depends(require_permission("databases:read")),
+) -> dict[str, Any]:
+    """Lightweight aggregated active query counter for real-time dashboard display."""
+    executor = get_node_executor()
+    mariadb_running = 0
+    mariadb_connected = 0
+    mariadb_slow = 0
+
+    status_res = await executor.run_command([
+        "/usr/bin/mariadb", "-B", "-e",
+        "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_running', 'Threads_connected', 'Slow_queries');"
+    ])
+    if status_res.ok and status_res.stdout.strip():
+        for line in status_res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2:
+                k, v = parts[0].strip(), parts[1].strip()
+                if k == "Threads_running" and v.isdigit():
+                    mariadb_running = int(v)
+                elif k == "Threads_connected" and v.isdigit():
+                    mariadb_connected = int(v)
+                elif k == "Slow_queries" and v.isdigit():
+                    mariadb_slow = int(v)
+
+    return {
+        "mariadb_running": mariadb_running,
+        "mariadb_connected": mariadb_connected,
+        "mariadb_slow": mariadb_slow,
+        "total_active": mariadb_running,
+    }

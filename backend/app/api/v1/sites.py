@@ -1,9 +1,12 @@
 """Domain & Website Hosting + Subdomain Management API router."""
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
+import re
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -503,3 +506,145 @@ async def delete_subdomain(
     )
     await db.commit()
     return {"deleted": True}
+
+
+# --- Domain Request Monitoring & Live Traffic Analytics ---
+
+NGINX_LOG_RE = re.compile(
+    r'^(?P<ip>\S+)\s+\S+\s+(?P<user>\S+)\s+\[(?P<time>[^\]]+)\]\s+"(?P<method>[A-Z]+)\s+(?P<path>[^\s"]+)(?:\s+HTTP/[\d.]+)?\"\s+(?P<status>\d{3})\s+(?P<bytes>\d+)(?:\s+"(?P<referer>[^"]*)"\s+"(?P<user_agent>[^"]*)")?.*'
+)
+
+
+def _format_bandwidth(bytes_val: int) -> str:
+    if bytes_val < 1024:
+        return f"{bytes_val} B"
+    elif bytes_val < 1024 * 1024:
+        return f"{round(bytes_val / 1024, 1)} KB"
+    elif bytes_val < 1024 * 1024 * 1024:
+        return f"{round(bytes_val / (1024 * 1024), 2)} MB"
+    return f"{round(bytes_val / (1024 * 1024 * 1024), 2)} GB"
+
+
+def _parse_nginx_logs(raw_lines: list[str]) -> dict[str, Any]:
+    total = 0
+    status_counts = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
+    status_exact: Counter[int] = Counter()
+    path_counts: Counter[str] = Counter()
+    ip_counts: Counter[str] = Counter()
+    method_counts: Counter[str] = Counter()
+    total_bytes = 0
+    recent_requests: list[dict[str, Any]] = []
+
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = NGINX_LOG_RE.match(line)
+        if not m:
+            continue
+        total += 1
+        d = m.groupdict()
+        status_code = int(d["status"])
+        byte_count = int(d["bytes"])
+        method = d["method"]
+        path = d["path"]
+        ip = d["ip"]
+
+        status_exact[status_code] += 1
+        if 200 <= status_code < 300:
+            status_counts["2xx"] += 1
+        elif 300 <= status_code < 400:
+            status_counts["3xx"] += 1
+        elif 400 <= status_code < 500:
+            status_counts["4xx"] += 1
+        elif 500 <= status_code < 600:
+            status_counts["5xx"] += 1
+
+        path_counts[path] += 1
+        ip_counts[ip] += 1
+        method_counts[method] += 1
+        total_bytes += byte_count
+
+        if len(recent_requests) < 50:
+            recent_requests.append({
+                "time": d["time"],
+                "ip": ip,
+                "method": method,
+                "path": path,
+                "status": status_code,
+                "bytes": byte_count,
+                "bytes_formatted": _format_bandwidth(byte_count),
+                "user_agent": d.get("user_agent") or "-",
+            })
+
+    def _calc_pct(cnt: int) -> float:
+        return round((cnt / total) * 100, 1) if total > 0 else 0.0
+
+    top_paths = [
+        {"path": p, "hits": hits, "percentage": _calc_pct(hits)}
+        for p, hits in path_counts.most_common(10)
+    ]
+    top_ips = [
+        {"ip": ip, "hits": hits, "percentage": _calc_pct(hits)}
+        for ip, hits in ip_counts.most_common(10)
+    ]
+
+    return {
+        "total_requests": total,
+        "total_bytes": total_bytes,
+        "bandwidth_formatted": _format_bandwidth(total_bytes),
+        "status_distribution": {
+            "2xx": {"count": status_counts["2xx"], "percentage": _calc_pct(status_counts["2xx"])},
+            "3xx": {"count": status_counts["3xx"], "percentage": _calc_pct(status_counts["3xx"])},
+            "4xx": {"count": status_counts["4xx"], "percentage": _calc_pct(status_counts["4xx"])},
+            "5xx": {"count": status_counts["5xx"], "percentage": _calc_pct(status_counts["5xx"])},
+        },
+        "top_paths": top_paths,
+        "top_ips": top_ips,
+        "method_counts": dict(method_counts),
+        "recent_requests": recent_requests,
+    }
+
+
+@router.get("/monitoring/overview")
+async def get_traffic_overview(
+    lines: int = Query(default=500, ge=50, le=2000),
+    _: User = Depends(require_permission("sites:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieve global HTTP request traffic overview and status code metrics."""
+    executor = get_node_executor()
+    res = await executor.read_log_file("/var/log/nginx/access.log", lines=lines)
+    raw_lines = res.stdout.splitlines() if res.ok and res.stdout.strip() else []
+    sites_count = (await db.execute(select(Website))).scalars().all()
+
+    analytics = _parse_nginx_logs(raw_lines)
+    analytics["active_sites_count"] = len(sites_count)
+    return analytics
+
+
+@router.get("/{site_id}/traffic")
+async def get_site_traffic(
+    site_id: int,
+    lines: int = Query(default=500, ge=50, le=2000),
+    _: User = Depends(require_permission("sites:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieve domain-specific request traffic, HTTP status distribution, top URLs, and visitor IPs."""
+    site = (await db.execute(select(Website).where(Website.id == site_id))).scalar_one_or_none()
+    if not site:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    executor = get_node_executor(site.node_id)
+    site_log = f"/var/log/nginx/{site.domain}.access.log"
+    res = await executor.read_log_file(site_log, lines=lines)
+    raw_lines = res.stdout.splitlines() if res.ok and res.stdout.strip() else []
+    if not raw_lines:
+        # Fallback to main access log filtered by domain
+        res_fb = await executor.read_log_file("/var/log/nginx/access.log", lines=lines, filter_text=site.domain)
+        raw_lines = res_fb.stdout.splitlines() if res_fb.ok else []
+
+    analytics = _parse_nginx_logs(raw_lines)
+    analytics["domain"] = site.domain
+    analytics["site_id"] = site.id
+    return analytics

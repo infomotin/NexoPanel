@@ -28,7 +28,7 @@ from app.core.config import settings
 from app.core.rbac import require_permission
 from app.core.security import decode_token
 from app.core.validators import validate_package_name
-from app.db.models import AuditLog, PanelSetting, User
+from app.db.models import AuditLog, PanelSetting, User, Website
 from app.db.session import get_db
 from app.drivers.distro import get_distro_driver
 from app.services.executor import get_node_executor
@@ -1227,15 +1227,237 @@ async def manage_packages(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-# --- Log Observability ---
+# --- Log Observability & System Diagnostics ---
+
+SYSTEM_LOG_TARGETS: dict[str, dict[str, str]] = {
+    # System core
+    "syslog": {"name": "System Syslog", "path": "/var/log/syslog", "category": "system", "type": "syslog"},
+    "auth": {"name": "Auth & Security Log", "path": "/var/log/auth.log", "category": "system", "type": "auth"},
+    "fail2ban": {"name": "Fail2Ban Protection", "path": "/var/log/fail2ban.log", "category": "system", "type": "security"},
+    "dmesg": {"name": "Kernel Ring Buffer (dmesg)", "path": "/var/log/dmesg", "category": "system", "type": "kernel"},
+    "mail": {"name": "Postfix / Dovecot Mail Log", "path": "/var/log/mail.log", "category": "system", "type": "mail"},
+    # Web & Reverse Proxy
+    "nginx_access": {"name": "Nginx Global Access", "path": "/var/log/nginx/access.log", "category": "web", "type": "access"},
+    "nginx_error": {"name": "Nginx Global Error", "path": "/var/log/nginx/error.log", "category": "web", "type": "error"},
+    # Application & Daemons
+    "nexopanel": {"name": "NexoPanel API Server", "path": str(settings.LOG_DIR / "nexopanel.log"), "category": "app", "type": "app"},
+    "php_fpm": {"name": "PHP-FPM Main Log", "path": "/var/log/php8.2-fpm.log", "category": "app", "type": "php"},
+    # Databases
+    "mariadb_error": {"name": "MariaDB Error Log", "path": "/var/log/mysql/error.log", "category": "database", "type": "database"},
+    "postgresql": {"name": "PostgreSQL Main Log", "path": "/var/log/postgresql/postgresql-16-main.log", "category": "database", "type": "database"},
+}
 
 LOG_TARGETS: dict[str, Path] = {
-    "nginx_access": Path("/var/log/nginx/access.log"),
-    "nginx_error": Path("/var/log/nginx/error.log"),
-    "syslog": Path("/var/log/syslog"),
-    "mail": Path("/var/log/mail.log"),
-    "nexopanel": settings.LOG_DIR / "nexopanel.log",
+    k: Path(v["path"]) for k, v in SYSTEM_LOG_TARGETS.items()
 }
+
+
+class ClearLogRequest(BaseModel):
+    target: str
+    path: str | None = None
+
+
+def _detect_log_level(line: str) -> str:
+    lower = line.lower()
+    if any(k in lower for k in ("error", "crit", "fatal", "emerg", "alert", "panic", "exception", "traceback")):
+        return "ERROR"
+    if any(k in lower for k in ("warn", "warning")):
+        return "WARN"
+    if any(k in lower for k in ("info", "notice", "start", "ready")):
+        return "INFO"
+    return "DEBUG"
+
+
+@router.get("/logs/catalog")
+async def get_logs_catalog(
+    _: User = Depends(require_permission("logs:read")),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Return categorized catalog of all observable system, web, app, database, and site log files."""
+    items: list[dict[str, Any]] = []
+
+    # 1. Built-in system targets
+    for target_id, info in SYSTEM_LOG_TARGETS.items():
+        p = Path(info["path"])
+        # Handle distro variations (e.g. php8.3 vs 8.2 or mariadb.log vs mysql/error.log)
+        alt_path = info["path"]
+        if not p.exists():
+            if target_id == "php_fpm":
+                for ver in ("php8.3-fpm.log", "php8.4-fpm.log", "php8.1-fpm.log", "php8.0-fpm.log", "php7.4-fpm.log"):
+                    candidate = Path(f"/var/log/{ver}")
+                    if candidate.exists():
+                        alt_path = str(candidate)
+                        break
+            elif target_id == "mariadb_error":
+                for candidate in (Path("/var/log/mariadb/mariadb.log"), Path("/var/log/mysql.err")):
+                    if candidate.exists():
+                        alt_path = str(candidate)
+                        break
+            elif target_id == "postgresql":
+                for candidate in Path("/var/log/postgresql").glob("*.log") if Path("/var/log/postgresql").exists() else []:
+                    alt_path = str(candidate)
+                    break
+
+        items.append({
+            "id": target_id,
+            "name": info["name"],
+            "path": alt_path,
+            "category": info["category"],
+            "type": info["type"],
+            "exists": Path(alt_path).exists(),
+            "size_bytes": Path(alt_path).stat().st_size if Path(alt_path).exists() else 0,
+        })
+
+    # 2. Dynamic website access and error logs
+    sites = (await db.execute(select(Website).order_by(Website.domain))).scalars().all()
+    for site in sites:
+        acc_path = f"/var/log/nginx/{site.domain}.access.log"
+        err_path = f"/var/log/nginx/{site.domain}.error.log"
+        items.append({
+            "id": f"site_{site.id}_access",
+            "name": f"{site.domain} (Access Log)",
+            "path": acc_path,
+            "category": "websites",
+            "type": "access",
+            "domain": site.domain,
+            "exists": Path(acc_path).exists(),
+            "size_bytes": Path(acc_path).stat().st_size if Path(acc_path).exists() else 0,
+        })
+        items.append({
+            "id": f"site_{site.id}_error",
+            "name": f"{site.domain} (Error Log)",
+            "path": err_path,
+            "category": "websites",
+            "type": "error",
+            "domain": site.domain,
+            "exists": Path(err_path).exists(),
+            "size_bytes": Path(err_path).stat().st_size if Path(err_path).exists() else 0,
+        })
+
+    return items
+
+
+@router.get("/logs/read")
+async def read_system_log(
+    target: str = Query(default="syslog"),
+    path: str | None = Query(default=None),
+    lines: int = Query(default=150, ge=10, le=2000),
+    search: str = Query(default=""),
+    level: str = Query(default="ALL"),
+    _: User = Depends(require_permission("logs:read")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Read privileged log files via daemon executor with keyword and severity level filtering."""
+    resolved_path: str = ""
+    if path and (path.startswith("/var/log/") or path.startswith(str(settings.LOG_DIR))):
+        resolved_path = path
+    elif target in SYSTEM_LOG_TARGETS:
+        resolved_path = SYSTEM_LOG_TARGETS[target]["path"]
+    elif target.startswith("site_"):
+        # Resolve from website domain
+        parts = target.split("_")
+        if len(parts) >= 3 and parts[1].isdigit():
+            s_id = int(parts[1])
+            site = (await db.execute(select(Website).where(Website.id == s_id))).scalar_one_or_none()
+            if site:
+                log_kind = parts[2]  # access or error
+                resolved_path = f"/var/log/nginx/{site.domain}.{log_kind}.log"
+
+    if not resolved_path:
+        raise HTTPException(status_code=400, detail="Invalid log target or file path specified")
+
+    executor = get_node_executor()
+    fetch_lines = min(2000, lines * 3 if level != "ALL" else lines)
+    log_res = await executor.read_log_file(resolved_path, lines=fetch_lines, filter_text=search)
+    raw_lines = log_res.stdout.splitlines() if log_res.ok else []
+
+    # Filter by level if specified
+    parsed_entries: list[dict[str, Any]] = []
+    for raw in raw_lines:
+        line_level = _detect_log_level(raw)
+        if level != "ALL" and line_level != level:
+            continue
+        parsed_entries.append({
+            "raw": raw,
+            "level": line_level,
+        })
+        if len(parsed_entries) >= lines:
+            break
+
+    file_obj = Path(resolved_path)
+    return {
+        "target": target,
+        "path": resolved_path,
+        "total_lines": len(parsed_entries),
+        "exists": file_obj.exists(),
+        "size_bytes": file_obj.stat().st_size if file_obj.exists() else 0,
+        "entries": parsed_entries,
+        "lines": [e["raw"] for e in parsed_entries],
+    }
+
+
+@router.post("/logs/clear")
+async def clear_system_log(
+    body: ClearLogRequest,
+    request: Request,
+    actor: User = Depends(require_permission("logs:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Truncate permitted log file on host."""
+    resolved_path: str = ""
+    if body.path and (body.path.startswith("/var/log/") or body.path.startswith(str(settings.LOG_DIR))):
+        resolved_path = body.path
+    elif body.target in SYSTEM_LOG_TARGETS:
+        resolved_path = SYSTEM_LOG_TARGETS[body.target]["path"]
+
+    if not resolved_path:
+        raise HTTPException(status_code=400, detail="Invalid log target or file path specified")
+
+    executor = get_node_executor()
+    clear_res = await executor.clear_log_file(resolved_path)
+    if not clear_res.ok:
+        raise HTTPException(status_code=500, detail="Failed to clear log file on host")
+
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="logs:write",
+        action="clear_log_file",
+        target_resource=resolved_path,
+    )
+    await db.commit()
+    return {"ok": True, "path": resolved_path, "cleared_at": datetime.now(timezone.utc).isoformat()}
+
+
+@router.post("/drop-caches")
+async def drop_ram_caches(
+    request: Request,
+    actor: User = Depends(require_permission("system:manage")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Free pagecache, dentries, and inodes (sync && echo 3 > /proc/sys/vm/drop_caches)."""
+    executor = get_node_executor()
+    mem_before = psutil.virtual_memory()
+    drop_res = await executor.drop_caches()
+    mem_after = psutil.virtual_memory()
+
+    freed_mb = round(max(0, (mem_before.used - mem_after.used) / (1024 * 1024)), 1)
+    await record_audit_event(
+        db,
+        actor=actor,
+        request=request,
+        permission="system:manage",
+        action="drop_caches",
+        target_resource="host:memory",
+    )
+    await db.commit()
+    return {
+        "ok": drop_res.ok,
+        "freed_mb": freed_mb,
+        "memory_used_percent": mem_after.percent,
+        "available_mb": round(mem_after.available / (1024 * 1024), 1),
+    }
 
 
 @router.get("/logs/{target}")
@@ -1245,26 +1467,18 @@ async def get_system_logs(
     search: str = Query(default=""),
     _: User = Depends(require_permission("logs:read")),
 ) -> dict:
-    if target not in LOG_TARGETS:
+    resolved_path: str = ""
+    if target in SYSTEM_LOG_TARGETS:
+        resolved_path = SYSTEM_LOG_TARGETS[target]["path"]
+    elif target in LOG_TARGETS:
+        resolved_path = str(LOG_TARGETS[target])
+    else:
         raise HTTPException(status_code=404, detail="Unknown log target")
-    path = LOG_TARGETS[target]
-    if not path.exists():
-        return {"target": target, "path": str(path), "lines": []}
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        # Log files are usually root-owned (e.g. /var/log/nginx/*.log); the
-        # unprivileged worker cannot read them. Report it instead of failing
-        # the whole request with a 500.
-        return {
-            "target": target,
-            "path": str(path),
-            "lines": [],
-            "error": f"Log file is not readable by the panel service user: {exc.strerror or exc}",
-        }
-    if search:
-        content = [l for l in content if search.lower() in l.lower()]
-    return {"target": target, "path": str(path), "lines": content[-lines:]}
+
+    executor = get_node_executor()
+    res = await executor.read_log_file(resolved_path, lines=lines, filter_text=search)
+    content = res.stdout.splitlines() if res.ok else []
+    return {"target": target, "path": resolved_path, "lines": content}
 
 
 # --- Immutable Audit Log ---

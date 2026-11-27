@@ -84,6 +84,15 @@ class NodeExecutor(ABC):
     @abstractmethod
     async def install_tree(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult: ...
 
+    @abstractmethod
+    async def read_log_file(self, path: str, lines: int = 100, filter_text: str | None = None) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def clear_log_file(self, path: str) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def drop_caches(self) -> ExecutionResult: ...
+
 
 class LocalNodeExecutor(NodeExecutor):
     """Executes privileged operations via root daemon Unix socket, or direct exec in dev/test."""
@@ -324,6 +333,46 @@ class LocalNodeExecutor(NodeExecutor):
         return await self._send_daemon_request(
             {"op": "install_tree", "source": source, "destination": destination, "owner": owner, "group": group}
         )
+
+    async def read_log_file(self, path: str, lines: int = 100, filter_text: str | None = None) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="[system] log mock entry 1\n[system] log mock entry 2", stderr="")
+        if self.socket_path.exists():
+            return await self._send_daemon_request({"op": "read_log_file", "path": path, "lines": lines, "filter": filter_text})
+        p = Path(path)
+        if not p.exists():
+            return ExecutionResult(returncode=1, stdout="", stderr="Log file not found")
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = [l.rstrip("\r\n") for l in f]
+                if filter_text:
+                    q = filter_text.lower()
+                    all_lines = [l for l in all_lines if q in l.lower()]
+                res = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                return ExecutionResult(returncode=0, stdout="\n".join(res), stderr="")
+        except OSError as exc:
+            return ExecutionResult(returncode=1, stdout="", stderr=str(exc))
+
+    async def clear_log_file(self, path: str) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="cleared", stderr="")
+        if self.socket_path.exists():
+            return await self._send_daemon_request({"op": "clear_log_file", "path": path})
+        p = Path(path)
+        if not p.exists():
+            return ExecutionResult(returncode=1, stdout="", stderr="Log file not found")
+        try:
+            p.write_text("", encoding="utf-8")
+            return ExecutionResult(returncode=0, stdout="cleared", stderr="")
+        except OSError as exc:
+            return ExecutionResult(returncode=1, stdout="", stderr=str(exc))
+
+    async def drop_caches(self) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="caches dropped", stderr="")
+        if self.socket_path.exists():
+            return await self._send_daemon_request({"op": "drop_caches"})
+        return ExecutionResult(returncode=0, stdout="caches dropped", stderr="")
 
 
 def get_node_executor(node_id: str = settings.LOCAL_NODE_ID) -> NodeExecutor:

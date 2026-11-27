@@ -535,7 +535,7 @@
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Domain Name</label>
-          <input v-model="newZone.domain" placeholder="example.com" class="np-input" :disabled="creatingZone" />
+          <input v-model="newZone.domain" @input="onDomainChange" placeholder="example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Primary Nameserver</label>
@@ -548,6 +548,10 @@
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Admin Email</label>
           <input v-model="newZone.admin_email" placeholder="hostmaster@example.com" class="np-input" :disabled="creatingZone" />
+        </div>
+        <div class="flex items-center gap-2 pt-1 pb-1">
+          <input id="create_default_recs" v-model="newZone.create_default_records" type="checkbox" class="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+          <label for="create_default_recs" class="text-[11px] text-slate-700 font-medium">Create default records (@ A, www, mail, ftp, MX, SPF)</label>
         </div>
         <div class="flex justify-end gap-2 pt-2">
           <button @click="showZoneModal = false" :disabled="creatingZone" class="np-btn-secondary">Cancel</button>
@@ -842,6 +846,7 @@ const newZone = reactive({
   primary_ns: 'ns1.localhost.localdomain',
   secondary_ns: '',
   admin_email: 'hostmaster@localhost.localdomain',
+  create_default_records: true,
 })
 const recForm = reactive<{ name: string; record_type: string; value: string; ttl: number; priority: number | null }>({
   name: '@',
@@ -1013,12 +1018,20 @@ async function refreshRecords() {
   records.value = await apiFetch<any[]>(`/dns/zones/${managingZone.value.id}/records`)
 }
 
+function onDomainChange() {
+  const d = (newZone.domain || '').trim().toLowerCase()
+  if (d && (!newZone.admin_email || newZone.admin_email.includes('localhost.localdomain') || newZone.admin_email.startsWith('hostmaster@'))) {
+    newZone.admin_email = `hostmaster@${d}`
+  }
+}
+
 function openZoneModal() {
   zoneError.value = ''
   newZone.domain = ''
   newZone.primary_ns = nameservers.value?.ns1 || 'ns1.localhost.localdomain'
   newZone.secondary_ns = nameservers.value?.ns2 || ''
   newZone.admin_email = 'hostmaster@localhost.localdomain'
+  newZone.create_default_records = true
   showZoneModal.value = true
 }
 

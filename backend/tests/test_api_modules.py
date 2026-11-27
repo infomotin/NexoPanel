@@ -536,3 +536,63 @@ async def test_update_status_endpoint(client: AsyncClient, admin_headers: dict[s
     for key in ("enabled", "repo_url", "current_version", "update_available", "checked_at"):
         assert key in data
     assert data["repo_url"].endswith("NexoPanel")
+
+
+async def test_system_logs_catalog_read_and_drop_caches(client: AsyncClient, admin_headers: dict[str, str]):
+    # 1. Catalog
+    cat_res = await client.get("/api/v1/system/logs/catalog", headers=admin_headers)
+    assert cat_res.status_code == 200
+    catalog = cat_res.json()
+    assert isinstance(catalog, list)
+    target_ids = {item["id"] for item in catalog}
+    assert {"syslog", "nginx_access", "nginx_error", "nexopanel"} <= target_ids
+
+    # 2. Read log
+    read_res = await client.get("/api/v1/system/logs/read?target=syslog&lines=50", headers=admin_headers)
+    assert read_res.status_code == 200
+    read_data = read_res.json()
+    assert "entries" in read_data
+    assert "lines" in read_data
+    assert read_data["target"] == "syslog"
+
+    # 3. Drop caches
+    drop_res = await client.post("/api/v1/system/drop-caches", headers=admin_headers)
+    assert drop_res.status_code == 200
+    drop_data = drop_res.json()
+    assert "ok" in drop_data
+    assert "freed_mb" in drop_data
+    assert "memory_used_percent" in drop_data
+
+
+async def test_database_queries_active_and_summary(client: AsyncClient, admin_headers: dict[str, str]):
+    # 1. Summary
+    sum_res = await client.get("/api/v1/databases/queries/summary", headers=admin_headers)
+    assert sum_res.status_code == 200
+    sum_data = sum_res.json()
+    assert "total_active" in sum_data
+    assert "mariadb_running" in sum_data
+
+    # 2. Active queries for MariaDB
+    act_res = await client.get("/api/v1/databases/queries/active?engine=mariadb", headers=admin_headers)
+    assert act_res.status_code == 200
+    act_data = act_res.json()
+    assert act_data["engine"] == "mariadb"
+    assert "stats" in act_data
+    assert "queries" in act_data
+
+    # 3. Active queries for PostgreSQL
+    pg_res = await client.get("/api/v1/databases/queries/active?engine=postgresql", headers=admin_headers)
+    assert pg_res.status_code == 200
+    assert pg_res.json()["engine"] == "postgresql"
+
+
+async def test_domain_monitoring_overview_and_traffic(client: AsyncClient, admin_headers: dict[str, str]):
+    # 1. Global traffic overview
+    ov_res = await client.get("/api/v1/sites/monitoring/overview", headers=admin_headers)
+    assert ov_res.status_code == 200
+    ov_data = ov_res.json()
+    assert "status_distribution" in ov_data
+    assert "2xx" in ov_data["status_distribution"]
+    assert "top_paths" in ov_data
+    assert "top_ips" in ov_data
+    assert "recent_requests" in ov_data
