@@ -15,6 +15,7 @@ MIN_DISK_GB=10
 
 GIT_REPO="${NEXOPANEL_GIT_REPO:-}"
 GIT_BRANCH="${NEXOPANEL_GIT_BRANCH:-main}"
+REBUILD_FRONTEND=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,6 +26,10 @@ while [[ $# -gt 0 ]]; do
     --branch)
       GIT_BRANCH="$2"
       shift 2
+      ;;
+    --rebuild|--rebuild-frontend)
+      REBUILD_FRONTEND=1
+      shift
       ;;
     *)
       shift
@@ -88,6 +93,7 @@ apt-get install -y -q \
   postfix postfix-pcre dovecot-core dovecot-imapd dovecot-pop3d opendkim opendkim-tools \
   bind9 bind9utils \
   mariadb-server postgresql \
+  pure-ftpd \
   ufw fail2ban \
   certbot python3 python3-venv python3-pip
 
@@ -121,22 +127,30 @@ if [[ -n "$GIT_REPO" ]]; then
     rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
     git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
   fi
+  REBUILD_FRONTEND=1
 elif [[ -d "${REPO_ROOT}/backend" ]]; then
-  log "Installing NexoPanel from local source/package (${REPO_ROOT})..."
-  rm -rf "${NEXOPANEL_HOME}/backend" "${NEXOPANEL_HOME}/frontend"
+  log "Installing/updating NexoPanel from local source (${REPO_ROOT})..."
+  rm -rf "${NEXOPANEL_HOME}/backend"
   cp -r "${REPO_ROOT}/backend" "${NEXOPANEL_HOME}/"
   if [[ -d "${REPO_ROOT}/frontend" ]]; then
-    cp -r "${REPO_ROOT}/frontend" "${NEXOPANEL_HOME}/"
+    mkdir -p "${NEXOPANEL_HOME}/frontend"
+    if [[ -d "${REPO_ROOT}/.git" ]]; then
+      REBUILD_FRONTEND=1
+      tar -C "${REPO_ROOT}/frontend" --exclude='node_modules' --exclude='.nuxt' --exclude='.output' --exclude='dist' -cf - . | tar -C "${NEXOPANEL_HOME}/frontend" -xf -
+    else
+      tar -C "${REPO_ROOT}/frontend" --exclude='node_modules' -cf - . | tar -C "${NEXOPANEL_HOME}/frontend" -xf -
+    fi
   fi
 else
   GIT_REPO="https://github.com/infomotin/NexoPanel.git"
   log "No local backend directory found; cloning from ${GIT_REPO} (${GIT_BRANCH})..."
   rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
   git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
+  REBUILD_FRONTEND=1
 fi
 
-# 5. Build Frontend Static Bundle if not pre-packaged
-if [[ -d "${NEXOPANEL_HOME}/frontend" && ! -d "${NEXOPANEL_HOME}/frontend/.output/public" ]]; then
+# 5. Build Frontend Static Bundle if not pre-packaged or source updated
+if [[ -d "${NEXOPANEL_HOME}/frontend" ]] && { [[ "$REBUILD_FRONTEND" -eq 1 ]] || [[ ! -f "${NEXOPANEL_HOME}/frontend/.output/public/index.html" ]]; }; then
   if ! command -v node >/dev/null 2>&1 || (( $(node -v | sed 's/v\([0-9]*\).*/\1/') < 20 )); then
     log "Installing Node.js 22 LTS for frontend build..."
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -146,6 +160,7 @@ if [[ -d "${NEXOPANEL_HOME}/frontend" && ! -d "${NEXOPANEL_HOME}/frontend/.outpu
   SERVER_IP="$(hostname -I | awk '{print $1}')"
   export NUXT_PUBLIC_API_BASE="/api/v1"
   export NUXT_PUBLIC_WS_BASE="ws://${SERVER_IP}:8443/api/v1"
+  rm -rf "${NEXOPANEL_HOME}/frontend/.output" "${NEXOPANEL_HOME}/frontend/.nuxt"
   npm --prefix "${NEXOPANEL_HOME}/frontend" install --no-audit --no-fund
   npm --prefix "${NEXOPANEL_HOME}/frontend" run generate
 fi
@@ -159,7 +174,7 @@ fi
 
 # 7. Bootstrap SQLite WAL Schema & Initial Admin Credentials
 INIT_ADMIN_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
-PYTHONPATH="${NEXOPANEL_HOME}/backend" \
+CREATED_PW=$(PYTHONPATH="${NEXOPANEL_HOME}/backend" \
 NEXOPANEL_DATABASE_PATH="${NEXOPANEL_DATA}/panel.db" \
 NEXOPANEL_MASTER_KEY_PATH="${NEXOPANEL_ETC}/master.key" \
 "${NEXOPANEL_HOME}/venv/bin/python" - <<PYEOF
@@ -170,10 +185,13 @@ from app.db.session import AsyncSessionLocal
 async def main():
     await init_db_schema()
     async with AsyncSessionLocal() as db:
-        await seed_defaults(db, initial_admin_password="${INIT_ADMIN_PASS}")
+        pw = await seed_defaults(db, initial_admin_password="${INIT_ADMIN_PASS}")
+        if pw:
+            print(pw)
 
 asyncio.run(main())
 PYEOF
+)
 chown nexopanel:nexopanel "${NEXOPANEL_DATA}/panel.db"*
 
 # 8. Install systemd units (nexopanel-daemon.service & nexopanel.service)
@@ -216,6 +234,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now nginx mariadb postgresql postfix dovecot named fail2ban nexopanel-daemon nexopanel
+systemctl enable --now pure-ftpd >/dev/null 2>&1 || true
 
 # Open panel port in UFW if active
 if ufw status | grep -q "Status: active"; then
@@ -225,8 +244,12 @@ fi
 SERVER_IP="$(hostname -I | awk '{print $1}')"
 echo ""
 log "========================================================"
-log " NexoPanel Installation Complete!"
+log " NexoPanel Installation / Upgrade Complete!"
 log " Panel URL:        http://${SERVER_IP}:8443"
 log " Initial Username: admin"
-log " Initial Password: ${INIT_ADMIN_PASS}"
+if [[ -n "$CREATED_PW" ]]; then
+  log " Initial Password: ${CREATED_PW}"
+else
+  log " Initial Password: (preserved existing admin password)"
+fi
 log "========================================================"

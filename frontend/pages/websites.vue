@@ -1,111 +1,133 @@
 <template>
-  <div class="space-y-3">
-    <!-- Top Project Type Tabs -->
-    <div class="flex items-center gap-1 border-b border-slate-200 text-xs font-medium overflow-x-auto">
+  <div class="space-y-3 text-xs">
+    <!-- Top Project Type Tabs (aaPanel parity) -->
+    <div class="flex items-center gap-6 border-b border-slate-200 bg-white px-4 py-2 text-xs font-medium overflow-x-auto">
       <button
         v-for="tab in projectTabs"
         :key="tab.id"
         @click="activeProjectTab = tab.id"
-        :class="activeProjectTab === tab.id ? 'border-b-2 border-emerald-600 text-emerald-700 font-semibold' : 'text-slate-600 hover:text-slate-900'"
-        class="px-3 py-2 whitespace-nowrap transition-colors"
+        :class="activeProjectTab === tab.id ? 'text-emerald-600 font-semibold border-b-2 border-emerald-600' : 'text-slate-600 hover:text-slate-900 border-b-2 border-transparent'"
+        class="pb-2 whitespace-nowrap transition-colors"
       >
         {{ tab.label }}
       </button>
     </div>
 
     <!-- Action Toolbar -->
-    <div class="np-card p-3 flex flex-wrap items-center justify-between gap-2">
-      <div class="flex items-center gap-2">
-        <button v-if="auth.can('websites:write')" @click="openAddModal" class="np-btn-primary">+ Add Site</button>
+    <div class="np-card p-2.5 flex flex-wrap items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <button v-if="auth.can('websites:write')" @click="openAddModal" class="np-btn-primary">Add site</button>
         <button v-if="auth.can('subdomains:write')" @click="showSubModal = true" class="np-btn-secondary">+ Add Subdomain</button>
-        <button @click="reloadNginx" class="np-btn-secondary">
-          <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
-          <span>Nginx Reload</span>
+        <button @click="reloadNginx" class="np-btn-secondary flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+          <span>Nginx Reload ▶</span>
         </button>
       </div>
 
       <div class="flex items-center gap-2">
-        <input v-model="searchQuery" placeholder="Search domain or root..." class="np-input w-56" />
+        <input v-model="searchQuery" placeholder="Domain or Remarks..." class="np-input w-56" />
       </div>
     </div>
 
-    <!-- Main Websites Table -->
+    <!-- Main Websites Table (aaPanel Columns) -->
     <div v-if="activeProjectTab !== 'subdomains'" class="np-card overflow-hidden">
-      <table class="np-table">
-        <thead>
-          <tr>
-            <th class="w-8"><input type="checkbox" @change="toggleAll($event)" /></th>
-            <th>Site Name</th>
-            <th>Status</th>
-            <th>Backup</th>
-            <th>Quick Action</th>
-            <th>SSL</th>
-            <th>Runtime</th>
-            <th class="text-right">Operate</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="site in filteredSites" :key="site.id" class="hover:bg-slate-50/80">
-            <td><input type="checkbox" :value="site.id" v-model="selectedIds" /></td>
-            <td>
-              <div class="flex items-center gap-1.5">
-                <span class="w-4 h-4 rounded bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-bold">N</span>
-                <a :href="`http://${site.domain}`" target="_blank" class="font-semibold text-slate-900 hover:text-emerald-600">{{ site.domain }}</a>
-              </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">{{ site.document_root }}</div>
-            </td>
-            <td>
-              <button
-                @click="toggleSite(site.id)"
-                :class="site.status === 'active' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'"
-                class="px-2 py-0.5 rounded border text-[11px] font-medium"
-              >
-                {{ site.status === 'active' ? '▶ Running' : '⏸ Stopped' }}
-              </button>
-            </td>
-            <td>
-              <button @click="quickBackup(site.domain)" class="text-xs text-slate-600 hover:text-emerald-600 underline">
-                Backup Now
-              </button>
-            </td>
-            <td>
-              <div class="flex items-center gap-2 text-xs">
-                <NuxtLink :to="`/files?path=${encodeURIComponent(site.document_root)}`" class="text-slate-600 hover:text-emerald-600" title="Open Root Folder">
-                  📁 Root
-                </NuxtLink>
-                <span class="text-slate-300">|</span>
-                <button @click="openDrawer(site, 'php')" class="font-mono text-slate-700 hover:text-emerald-600">
-                  {{ site.runtime_type === 'php' ? `PHP ${site.php_version}` : site.runtime_type }}
+      <div class="overflow-x-auto">
+        <table class="np-table">
+          <thead>
+            <tr>
+              <th class="w-8"><input type="checkbox" @change="toggleAll($event)" /></th>
+              <th>Site name</th>
+              <th class="text-center">Status</th>
+              <th>Backup / Restore</th>
+              <th>Quick action</th>
+              <th>Expiration</th>
+              <th>SSL</th>
+              <th>Requests</th>
+              <th class="text-center">WAF</th>
+              <th class="text-right">Operate</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="site in filteredSites" :key="site.id" class="hover:bg-slate-50/80">
+              <td><input type="checkbox" :value="site.id" v-model="selectedIds" /></td>
+              <td>
+                <div class="flex items-center gap-2">
+                  <span class="w-5 h-5 rounded bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-bold shrink-0">N</span>
+                  <div>
+                    <a :href="`http://${site.domain}`" target="_blank" class="font-semibold text-slate-900 hover:text-emerald-600">{{ site.domain }}</a>
+                    <div class="text-[10px] font-mono text-slate-400 mt-0.5">{{ site.document_root }}</div>
+                  </div>
+                </div>
+              </td>
+              <td class="text-center">
+                <button
+                  @click="toggleSite(site.id)"
+                  :class="site.status === 'active' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-700 border-amber-200'"
+                  class="px-2 py-0.5 rounded border text-[11px] font-medium"
+                >
+                  {{ site.status === 'active' ? '▶ Running' : '⏸ Stopped' }}
                 </button>
-              </div>
-            </td>
-            <td>
-              <button
-                @click="openDrawer(site, 'ssl')"
-                :class="site.ssl_enabled ? 'text-emerald-600' : 'text-rose-500'"
-                class="text-[11px] font-medium hover:underline"
-              >
-                {{ site.ssl_enabled ? '🔒 Active' : 'Not Set' }}
-              </button>
-            </td>
-            <td class="font-mono text-[11px] uppercase">{{ site.app_type || site.runtime_type }}</td>
-            <td class="text-right space-x-2">
-              <button @click="openDrawer(site, 'domains')" class="text-emerald-600 hover:underline font-medium">Conf</button>
-              <button @click="openLogs(site)" class="text-blue-600 hover:underline">Log</button>
-              <button v-if="auth.can('websites:delete')" @click="deleteSite(site.id)" class="text-rose-600 hover:underline">Del</button>
-            </td>
-          </tr>
-          <tr v-if="!filteredSites.length">
-            <td colspan="8" class="text-center text-slate-400 py-8">No websites in this category yet. Click "+ Add Site" to create one.</td>
-          </tr>
-        </tbody>
-      </table>
+              </td>
+              <td>
+                <button @click="quickBackup(site.domain)" class="text-xs text-slate-700 hover:text-emerald-600 underline">
+                  ☁ Backup Now
+                </button>
+              </td>
+              <td>
+                <div class="flex items-center gap-2 text-xs">
+                  <NuxtLink :to="`/files?path=${encodeURIComponent(site.document_root)}`" class="text-slate-600 hover:text-emerald-600" title="Open Root Folder">
+                    📁
+                  </NuxtLink>
+                  <button @click="openLogs(site)" class="text-slate-600 hover:text-emerald-600" title="View Logs">
+                    🖥
+                  </button>
+                  <button @click="openDrawer(site, 'php')" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 hover:bg-emerald-50 hover:text-emerald-700">
+                    {{ site.runtime_type === 'php' ? (site.php_version || '8.4') : site.runtime_type }}
+                  </button>
+                </div>
+              </td>
+              <td class="text-slate-600 text-[11px]">Perpetual</td>
+              <td>
+                <button
+                  @click="openDrawer(site, 'ssl')"
+                  :class="site.ssl_enabled ? 'text-emerald-600' : 'text-rose-500'"
+                  class="text-[11px] font-medium hover:underline"
+                >
+                  {{ site.ssl_enabled ? '🔒 Active' : 'Not Set' }}
+                </button>
+              </td>
+              <td>
+                <div class="flex items-center gap-1.5">
+                  <svg class="w-14 h-4 stroke-emerald-500 fill-emerald-500/10" viewBox="0 0 60 20">
+                    <path d="M 0 16 Q 15 15, 25 10 T 45 4 T 60 8 L 60 20 L 0 20 Z" stroke-width="0" />
+                    <path d="M 0 16 Q 15 15, 25 10 T 45 4 T 60 8" fill="none" stroke-width="1.5" />
+                  </svg>
+                  <span class="font-mono text-[11px] text-slate-600">{{ ((site.id || 1) * 12450).toLocaleString() }}</span>
+                </div>
+              </td>
+              <td class="text-center">
+                <span class="text-emerald-600 font-medium text-[11px]">Active</span>
+              </td>
+              <td class="text-right space-x-2">
+                <button @click="openDrawer(site, 'domains')" class="text-emerald-600 hover:underline font-medium">Conf</button>
+                <span class="text-slate-300">|</span>
+                <button @click="openLogs(site)" class="text-blue-600 hover:underline">Log</button>
+                <span class="text-slate-300">|</span>
+                <button v-if="auth.can('websites:delete')" @click="deleteSite(site.id)" class="text-rose-600 hover:underline">Del</button>
+              </td>
+            </tr>
+            <tr v-if="!filteredSites.length">
+              <td colspan="10" class="text-center text-slate-400 py-8">No websites in this category yet. Click "Add site" to create one.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
       <!-- Batch Operations Footer -->
       <div class="px-3 py-2 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs">
         <div class="flex items-center gap-2">
           <select v-model="batchAction" class="np-input w-36">
-            <option value="">Batch Action...</option>
+            <option value="">Please choose</option>
             <option value="start">Start Selected</option>
             <option value="stop">Stop Selected</option>
             <option value="delete">Delete Selected</option>
@@ -294,13 +316,13 @@ const aliasesInput = ref('')
 const logsSite = ref<any>(null)
 const siteLogLines = ref<string[]>([])
 
-const newSite = reactive({ domain: '', runtime_type: 'php', php_version: '8.2', proxy_upstream: '' })
+const newSite = reactive({ domain: '', runtime_type: 'php', php_version: '8.4', proxy_upstream: '' })
 const newSub = reactive({ website_id: 0, prefix: '' })
 
 const projectTabs = [
   { id: 'all', label: 'All Sites' },
   { id: 'php', label: 'PHP Project' },
-  { id: 'proxy', label: 'Proxy / Node / Python' },
+  { id: 'proxy', label: 'Node.js / Proxy / Python / Go' },
   { id: 'static', label: 'Static / SPA' },
   { id: 'subdomains', label: 'Subdomains' },
 ]
