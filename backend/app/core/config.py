@@ -60,6 +60,11 @@ class Settings(BaseSettings):
 
     # Privilege-separated Root Daemon
     DAEMON_SOCKET_PATH: Path = Path("/run/nexopanel/daemon.sock")
+
+    # Private staging directory shared with the privileged daemon: content that
+    # the unprivileged worker prepares here (archives, extracted trees) may be
+    # installed into the panel-owned roots.
+    DAEMON_TEMP_DIR: Path = Path("/run/nexopanel/tmp")
     DAEMON_USE_MOCK_EXECUTOR: bool = False
 
     # Node Context (Single-Node default, Multi-Node ready)

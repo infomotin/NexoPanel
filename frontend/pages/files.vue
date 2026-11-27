@@ -279,6 +279,7 @@
               <button v-if="!entry.is_dir" @click="downloadFile(entry.path)" class="text-emerald-600 hover:underline">Download</button>
               <button v-if="!entry.is_dir && isArchive(entry.name)" @click="extractArchive(entry.path)" class="text-blue-600 hover:underline">Extract</button>
               <button @click="openRenameModal(entry)" class="text-slate-600 hover:underline">Rename</button>
+              <button @click="copyEntry(entry)" class="text-slate-600 hover:underline">Copy</button>
               <button @click="openChmodModal(entry)" class="text-slate-600 hover:underline">PMSN</button>
               <button @click="trashEntry(entry.path)" class="text-rose-600 hover:underline">Delete</button>
             </td>
@@ -507,6 +508,18 @@
         </div>
       </div>
     </div>
+    <!-- Toasts -->
+    <div class="fixed bottom-4 right-4 z-[100] space-y-2 w-80 max-w-[90vw]">
+      <div
+        v-for="t in toasts"
+        :key="t.id"
+        class="px-3 py-2 rounded shadow-lg border text-xs flex items-start gap-2"
+        :class="t.type === 'error' ? 'bg-rose-50 border-rose-200 text-rose-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'"
+      >
+        <span class="flex-1 break-words">{{ t.message }}</span>
+        <button @click="dismissToast(t.id)" class="text-slate-400 hover:text-slate-700 leading-none">×</button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -590,6 +603,25 @@ const fileLogs = ref<any[]>([])
 const showTrashModal = ref(false)
 const trashItems = ref<any[]>([])
 
+// --- Toasts (operation feedback) -------------------------------------
+const toasts = ref<{ id: number; type: 'success' | 'error'; message: string }[]>([])
+let toastSeq = 0
+
+function notify(type: 'success' | 'error', message: string) {
+  const id = ++toastSeq
+  toasts.value.push({ id, type, message })
+  setTimeout(() => dismissToast(id), type === 'error' ? 9000 : 4000)
+}
+
+function dismissToast(id: number) {
+  toasts.value = toasts.value.filter((t) => t.id !== id)
+}
+
+function notifyError(err: unknown, fallback = 'Operation failed') {
+  const message = err instanceof Error && err.message ? err.message : fallback
+  notify('error', message)
+}
+
 const pathSegments = computed(() => {
   const parts = currentPath.value.split('/').filter(Boolean)
   return parts.map((name, idx) => ({
@@ -661,6 +693,8 @@ async function loadDir(path: string) {
       tab.path = res.path
       tab.label = res.path.split('/').filter(Boolean).pop() || 'Root'
     }
+  } catch (e) {
+    notifyError(e, `Could not open ${path}`)
   } finally {
     loading.value = false
   }
@@ -710,8 +744,12 @@ async function runFileSearch() {
     return
   }
   if (includeSubdir.value) {
-    const res = await apiFetch<any>(`/files/search?path=${encodeURIComponent(currentPath.value)}&query=${encodeURIComponent(fileSearch.value.trim())}`)
-    searchResults.value = res.matches || []
+    try {
+      const res = await apiFetch<any>(`/files/search?path=${encodeURIComponent(currentPath.value)}&query=${encodeURIComponent(fileSearch.value.trim())}`)
+      searchResults.value = res.matches || []
+    } catch (e) {
+      notifyError(e, 'Search failed')
+    }
   } else {
     searchResults.value = null
   }
@@ -723,49 +761,95 @@ function toggleAll(e: Event) {
 }
 
 async function calculateDirSize(path: string) {
-  const res = await apiFetch<any>(`/files/size?path=${encodeURIComponent(path)}`)
-  dirSizes.value[path] = res.size
+  try {
+    const res = await apiFetch<any>(`/files/size?path=${encodeURIComponent(path)}`)
+    dirSizes.value[path] = res.size
+  } catch (e) {
+    notifyError(e, 'Could not calculate size')
+  }
 }
 
 async function calculateTotalSize() {
-  const res = await apiFetch<any>(`/files/size?path=${encodeURIComponent(currentPath.value)}`)
-  totalFolderSize.value = res.size
+  try {
+    const res = await apiFetch<any>(`/files/size?path=${encodeURIComponent(currentPath.value)}`)
+    totalFolderSize.value = res.size
+  } catch (e) {
+    notifyError(e, 'Could not calculate size')
+  }
 }
 
 async function editFile(path: string) {
-  const res = await apiFetch<any>(`/files/read?path=${encodeURIComponent(path)}`)
-  editingPath.value = res.path
-  editingContent.value = res.content
+  try {
+    const res = await apiFetch<any>(`/files/read?path=${encodeURIComponent(path)}`)
+    editingPath.value = res.path
+    editingContent.value = res.content
+  } catch (e) {
+    notifyError(e, 'Could not open the file')
+  }
 }
 
 async function saveFile() {
-  await apiFetch('/files/write', { method: 'POST', body: { path: editingPath.value, content: editingContent.value } })
-  editingPath.value = ''
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch('/files/write', { method: 'POST', body: { path: editingPath.value, content: editingContent.value } })
+    notify('success', `Saved ${editingPath.value}`)
+    editingPath.value = ''
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not save the file')
+  }
 }
 
-function downloadFile(path: string) {
-  const url = `${apiBase}/files/download?path=${encodeURIComponent(path)}`
-  fetch(url, { headers: { Authorization: `Bearer ${auth.token}` } })
-    .then((r) => r.blob())
-    .then((blob) => {
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = path.split('/').pop() || 'file'
-      a.click()
+async function downloadFile(path: string) {
+  try {
+    // The session cookie is sent automatically for same-origin requests; the
+    // bearer token is only present right after a login (it is kept in memory).
+    const res = await fetch(`${apiBase}/files/download?path=${encodeURIComponent(path)}`, {
+      credentials: 'same-origin',
+      headers: auth.token ? { Authorization: `Bearer ${auth.token}` } : {},
     })
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`
+      try {
+        const data = await res.json()
+        detail = typeof data?.detail === 'string' ? data.detail : detail
+      } catch {
+        // keep the status-based message
+      }
+      throw new Error(detail)
+    }
+    const blob = await res.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = path.split('/').pop() || 'file'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(a.href)
+  } catch (e) {
+    notifyError(e, 'Download failed')
+  }
 }
 
 async function uploadFiles(e: Event) {
   const input = e.target as HTMLInputElement
   if (!input.files?.length) return
-  for (const file of Array.from(input.files)) {
+  const files = Array.from(input.files)
+  let failed = 0
+  for (const file of files) {
     const fd = new FormData()
     fd.append('path', currentPath.value)
     fd.append('file', file)
-    await apiFetch('/files/upload', { method: 'POST', body: fd })
+    fd.append('chunk_index', '0')
+    fd.append('total_chunks', '1')
+    try {
+      await apiFetch('/files/upload', { method: 'POST', body: fd })
+    } catch (err) {
+      failed++
+      notifyError(err, `Could not upload ${file.name}`)
+    }
   }
   input.value = ''
+  if (failed === 0) notify('success', `Uploaded ${files.length} file(s)`)
   await loadDir(currentPath.value)
 }
 
@@ -778,13 +862,19 @@ async function createNewItem() {
   const name = newItemName.value.trim()
   if (!name) return
   const target = `${currentPath.value.replace(/\/$/, '')}/${name}`
-  if (newModalType.value === 'dir') {
-    await apiFetch('/files/mkdir', { method: 'POST', body: { source: target } })
-  } else {
-    await apiFetch('/files/write', { method: 'POST', body: { path: target, content: '' } })
+  try {
+    if (newModalType.value === 'dir') {
+      await apiFetch('/files/mkdir', { method: 'POST', body: { source: target } })
+      notify('success', `Created folder ${name}`)
+    } else {
+      await apiFetch('/files/write', { method: 'POST', body: { path: target, content: '' } })
+      notify('success', `Created file ${name}`)
+    }
+    newModalType.value = null
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not create the item')
   }
-  newModalType.value = null
-  await loadDir(currentPath.value)
 }
 
 function openRenameModal(entry: any) {
@@ -796,9 +886,28 @@ async function applyRename() {
   if (!renameTarget.value || !renameNewName.value.trim()) return
   const parent = renameTarget.value.path.split('/').slice(0, -1).join('/') || '/'
   const dst = `${parent}/${renameNewName.value.trim()}`
-  await apiFetch('/files/rename', { method: 'POST', body: { source: renameTarget.value.path, destination: dst } })
-  renameTarget.value = null
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch('/files/rename', { method: 'POST', body: { source: renameTarget.value.path, destination: dst } })
+    notify('success', `Renamed to ${renameNewName.value.trim()}`)
+    renameTarget.value = null
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not rename the item')
+  }
+}
+
+async function copyEntry(entry: any) {
+  const name = prompt(`Copy "${entry.name}" to (new name):`, entry.name)
+  if (!name || !name.trim()) return
+  const parent = entry.path.split('/').slice(0, -1).join('/') || '/'
+  const dst = `${parent}/${name.trim()}`
+  try {
+    await apiFetch('/files/copy', { method: 'POST', body: { source: entry.path, destination: dst } })
+    notify('success', `Copied to ${name.trim()}`)
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not copy the item')
+  }
 }
 
 function openChmodModal(entry: any) {
@@ -827,40 +936,67 @@ function syncOctalFromBits() {
 
 async function applyChmod() {
   if (!chmodTarget.value) return
-  await apiFetch('/files/chmod', { method: 'POST', body: { path: chmodTarget.value.path, mode: chmodOctal.value } })
-  chmodTarget.value = null
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch('/files/chmod', { method: 'POST', body: { path: chmodTarget.value.path, mode: chmodOctal.value } })
+    notify('success', `Permissions updated to ${chmodOctal.value}`)
+    chmodTarget.value = null
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not change the permissions')
+  }
 }
 
 async function extractArchive(path: string) {
-  await apiFetch('/files/extract', { method: 'POST', body: { archive_path: path, destination_dir: currentPath.value } })
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch('/files/extract', { method: 'POST', body: { archive_path: path, destination_dir: currentPath.value } })
+    notify('success', `Extracted ${path.split('/').pop()}`)
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not extract the archive')
+  }
 }
 
 async function compressSelected() {
   const name = prompt('Archive filename:', `archive_${Date.now()}.zip`)
   if (!name) return
   const out = `${currentPath.value.replace(/\/$/, '')}/${name}`
-  await apiFetch('/files/archive', {
-    method: 'POST',
-    body: { paths: selectedPaths.value, output_path: out, format: name.endsWith('.zip') ? 'zip' : 'tar.gz' },
-  })
-  selectedPaths.value = []
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch('/files/archive', {
+      method: 'POST',
+      body: { paths: selectedPaths.value, output_path: out, format: name.endsWith('.zip') ? 'zip' : 'tar.gz' },
+    })
+    notify('success', `Created ${name}`)
+    selectedPaths.value = []
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not create the archive')
+  }
 }
 
 async function trashEntry(path: string) {
   if (!confirm(`Move ${path.split('/').pop()} to Recycle Bin?`)) return
-  await apiFetch(`/files/trash/move?path=${encodeURIComponent(path)}`, { method: 'POST' })
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch(`/files/trash/move?path=${encodeURIComponent(path)}`, { method: 'POST' })
+    notify('success', `Moved ${path.split('/').pop()} to the Recycle Bin`)
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not move the item to the Recycle Bin')
+  }
 }
 
 async function batchTrash() {
   if (!confirm(`Move ${selectedPaths.value.length} selected items to Recycle Bin?`)) return
+  let failed = 0
   for (const p of selectedPaths.value) {
-    await apiFetch(`/files/trash/move?path=${encodeURIComponent(p)}`, { method: 'POST' })
+    try {
+      await apiFetch(`/files/trash/move?path=${encodeURIComponent(p)}`, { method: 'POST' })
+    } catch (e) {
+      failed++
+      notifyError(e, `Could not move ${p}`)
+    }
   }
   selectedPaths.value = []
+  if (failed === 0) notify('success', 'Items moved to the Recycle Bin')
   await loadDir(currentPath.value)
 }
 
@@ -876,10 +1012,13 @@ async function runRemoteDownload() {
         filename: remoteForm.filename.trim() || null,
       },
     })
+    notify('success', 'Remote file downloaded')
     showRemoteModal.value = false
     remoteForm.url = ''
     remoteForm.filename = ''
     await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not download the remote file')
   } finally {
     remoteDownloading.value = false
   }
@@ -893,35 +1032,62 @@ function openContentSearch() {
 
 async function runContentSearch() {
   if (!contentQuery.value.trim()) return
-  const res = await apiFetch<any>(`/files/search-content?path=${encodeURIComponent(currentPath.value)}&query=${encodeURIComponent(contentQuery.value.trim())}`)
-  contentMatches.value = res.matches || []
+  try {
+    const res = await apiFetch<any>(`/files/search-content?path=${encodeURIComponent(currentPath.value)}&query=${encodeURIComponent(contentQuery.value.trim())}`)
+    contentMatches.value = res.matches || []
+  } catch (e) {
+    notifyError(e, 'Content search failed')
+  }
 }
 
 async function openOperationLogs() {
-  fileLogs.value = await apiFetch<any[]>('/files/logs')
-  showLogsModal.value = true
+  try {
+    fileLogs.value = await apiFetch<any[]>('/files/logs')
+    showLogsModal.value = true
+  } catch (e) {
+    notifyError(e, 'Could not load the operation logs')
+  }
 }
 
 async function openRecycleBin() {
-  trashItems.value = await apiFetch<any[]>('/files/trash')
-  showTrashModal.value = true
+  try {
+    trashItems.value = await apiFetch<any[]>('/files/trash')
+    showTrashModal.value = true
+  } catch (e) {
+    notifyError(e, 'Could not open the Recycle Bin')
+  }
 }
 
 async function restoreTrash(id: number) {
-  await apiFetch(`/files/trash/${id}/restore`, { method: 'POST' })
-  trashItems.value = await apiFetch<any[]>('/files/trash')
-  await loadDir(currentPath.value)
+  try {
+    await apiFetch(`/files/trash/${id}/restore`, { method: 'POST' })
+    trashItems.value = await apiFetch<any[]>('/files/trash')
+    notify('success', 'Item restored')
+    await loadDir(currentPath.value)
+  } catch (e) {
+    notifyError(e, 'Could not restore the item')
+  }
 }
 
 async function deleteTrashPermanent(id: number) {
-  await apiFetch(`/files/trash/${id}`, { method: 'DELETE' })
-  trashItems.value = await apiFetch<any[]>('/files/trash')
+  try {
+    await apiFetch(`/files/trash/${id}`, { method: 'DELETE' })
+    trashItems.value = await apiFetch<any[]>('/files/trash')
+    notify('success', 'Item permanently deleted')
+  } catch (e) {
+    notifyError(e, 'Could not delete the item')
+  }
 }
 
 async function emptyTrashBin() {
   if (!confirm('Permanently delete all items in Recycle Bin?')) return
-  await apiFetch('/files/trash', { method: 'DELETE' })
-  trashItems.value = []
+  try {
+    await apiFetch('/files/trash', { method: 'DELETE' })
+    trashItems.value = []
+    notify('success', 'Recycle Bin emptied')
+  } catch (e) {
+    notifyError(e, 'Could not empty the Recycle Bin')
+  }
 }
 
 function toggleFavoriteCurrent() {

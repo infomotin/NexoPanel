@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +45,42 @@ class NodeExecutor(ABC):
 
     @abstractmethod
     async def ensure_directory(self, path: str, owner: str = "www-data", group: str = "www-data", mode: int = 0o755) -> ExecutionResult: ...
+
+    # --- File manager helpers (the API worker is unprivileged) -------------
+    @abstractmethod
+    async def write_bytes(
+        self,
+        path: str,
+        data: bytes,
+        mode: int = 0o644,
+        *,
+        append: bool = False,
+        owner: str | None = None,
+        group: str | None = None,
+    ) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def read_bytes(self, path: str, max_bytes: int = 32 * 1024 * 1024) -> bytes: ...
+
+    @abstractmethod
+    async def move_item(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def copy_item(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def chmod_item(self, path: str, mode: int) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def remove_item(self, path: str) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def install_file(
+        self, source: str, destination: str, mode: int = 0o644, *, owner: str | None = None, group: str | None = None
+    ) -> ExecutionResult: ...
+
+    @abstractmethod
+    async def install_tree(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult: ...
 
 
 class LocalNodeExecutor(NodeExecutor):
@@ -116,15 +155,149 @@ class LocalNodeExecutor(NodeExecutor):
         return await self._send_daemon_request({"op": "remove_file", "path": path})
 
     async def ensure_directory(
-        self, path: str, owner: str = "www-data", group: str = "www-data", mode: int = 0o755
+        self,
+        path: str,
+        owner: str = "www-data",
+        group: str = "www-data",
+        mode: int = 0o755,
+        scope: str | None = None,
     ) -> ExecutionResult:
         if self.use_mock:
             return ExecutionResult(returncode=0, stdout="", stderr="")
         if not self.socket_path.exists():
             Path(path).mkdir(parents=True, exist_ok=True)
             return ExecutionResult(returncode=0, stdout="", stderr="")
+        payload: dict[str, Any] = {
+            "op": "ensure_dir",
+            "path": path,
+            "owner": owner,
+            "group": group,
+            "mode": mode,
+        }
+        if scope:
+            payload["scope"] = scope
+        return await self._send_daemon_request(payload)
+
+    # --- File manager helpers --------------------------------------------
+
+    async def write_bytes(
+        self,
+        path: str,
+        data: bytes,
+        mode: int = 0o644,
+        *,
+        append: bool = False,
+        owner: str | None = None,
+        group: str | None = None,
+    ) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="written", stderr="")
+        if not self.socket_path.exists():
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("ab" if append else "wb") as fh:
+                fh.write(data)
+            return ExecutionResult(returncode=0, stdout="written", stderr="")
         return await self._send_daemon_request(
-            {"op": "ensure_dir", "path": path, "owner": owner, "group": group, "mode": mode}
+            {
+                "op": "write_bytes",
+                "path": path,
+                "content_b64": base64.b64encode(data).decode("ascii"),
+                "mode": mode,
+                "append": append,
+                "owner": owner,
+                "group": group,
+            }
+        )
+
+    async def read_bytes(self, path: str, max_bytes: int = 32 * 1024 * 1024) -> bytes:
+        if self.use_mock:
+            return b""
+        if not self.socket_path.exists():
+            return Path(path).read_bytes()
+        res = await self._send_daemon_request({"op": "read_file", "path": path})
+        if not res.ok:
+            raise RuntimeError(res.stderr or "privileged read failed")
+        try:
+            data = base64.b64decode(res.stdout.encode("ascii"), validate=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError("invalid privileged read payload") from exc
+        if len(data) > max_bytes:
+            raise RuntimeError("file too large")
+        return data
+
+    async def move_item(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="moved", stderr="")
+        if not self.socket_path.exists():
+            shutil.move(source, destination)
+            return ExecutionResult(returncode=0, stdout="moved", stderr="")
+        return await self._send_daemon_request(
+            {"op": "move_item", "source": source, "destination": destination, "owner": owner, "group": group}
+        )
+
+    async def copy_item(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="copied", stderr="")
+        if not self.socket_path.exists():
+            src, dst = Path(source), Path(destination)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=False)
+            else:
+                shutil.copy2(src, dst)
+            return ExecutionResult(returncode=0, stdout="copied", stderr="")
+        return await self._send_daemon_request(
+            {"op": "copy_item", "source": source, "destination": destination, "owner": owner, "group": group}
+        )
+
+    async def chmod_item(self, path: str, mode: int) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="chmod", stderr="")
+        if not self.socket_path.exists():
+            os.chmod(path, mode)
+            return ExecutionResult(returncode=0, stdout="chmod", stderr="")
+        return await self._send_daemon_request({"op": "chmod_item", "path": path, "mode": mode})
+
+    async def remove_item(self, path: str) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="removed", stderr="")
+        if not self.socket_path.exists():
+            target = Path(path)
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            return ExecutionResult(returncode=0, stdout="removed", stderr="")
+        return await self._send_daemon_request({"op": "remove_item", "path": path})
+
+    async def install_file(
+        self, source: str, destination: str, mode: int = 0o644, *, owner: str | None = None, group: str | None = None
+    ) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="installed", stderr="")
+        if not self.socket_path.exists():
+            shutil.copyfile(source, destination)
+            os.chmod(destination, mode)
+            return ExecutionResult(returncode=0, stdout="installed", stderr="")
+        return await self._send_daemon_request(
+            {
+                "op": "install_file",
+                "source": source,
+                "destination": destination,
+                "mode": mode,
+                "owner": owner,
+                "group": group,
+            }
+        )
+
+    async def install_tree(self, source: str, destination: str, *, owner: str | None = None, group: str | None = None) -> ExecutionResult:
+        if self.use_mock:
+            return ExecutionResult(returncode=0, stdout="installed", stderr="")
+        if not self.socket_path.exists():
+            shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=False)
+            return ExecutionResult(returncode=0, stdout="installed", stderr="")
+        return await self._send_daemon_request(
+            {"op": "install_tree", "source": source, "destination": destination, "owner": owner, "group": group}
         )
 
 

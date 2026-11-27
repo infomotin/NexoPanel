@@ -16,6 +16,7 @@ Security notes:
 from __future__ import annotations
 
 import asyncio
+import base64
 import errno
 import grp
 import ipaddress
@@ -23,6 +24,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,20 @@ ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
 
 # Root-only scratch directory is no longer needed: the control plane performs
 # archive handling in-process (tarfile) and downloads through the API worker.
+
+# Roots the file manager may mutate through the privileged daemon. This is
+# intentionally narrower than ALLOWED_WRITE_PREFIXES: the file manager must
+# never be able to touch system configuration such as /etc/nginx/nginx.conf.
+FILE_MANAGER_PREFIXES: tuple[str, ...] = (
+    "/var/www/",
+    "/var/backups/nexopanel/",
+    "/etc/nginx/sites-available/",
+)
+
+# Private staging directory used to hand content (archives, extracted trees)
+# from the unprivileged worker over to the privileged daemon. Only files that
+# live inside this directory may be installed into the panel-owned roots.
+TEMP_BASE = Path(os.environ.get("NEXOPANEL_DAEMON_TEMP_DIR", "/run/nexopanel/tmp"))
 
 # `cp` is only used to migrate FTP home directories, so it is restricted to the
 # panel-owned web/backups roots instead of every writable configuration root.
@@ -145,16 +161,48 @@ ALLOWED_FETCH_HOSTS = {
 }
 
 
-def _is_allowed_path(path_str: str) -> bool:
+def _is_allowed_path(path_str: str, prefixes: tuple[str, ...] = ALLOWED_WRITE_PREFIXES) -> bool:
     """Resolve symlinks and '..' before comparing against the write allowlist."""
     if not path_str or "\x00" in path_str or ".." in Path(path_str).parts:
         return False
     resolved = Path(os.path.realpath(path_str))
-    for prefix in ALLOWED_WRITE_PREFIXES:
+    for prefix in prefixes:
         root = Path(os.path.realpath(prefix))
         if resolved == root or root in resolved.parents:
             return True
     return False
+
+
+def _is_file_manager_path(path_str: str) -> bool:
+    """True when the path may be mutated through the file-manager operations."""
+    return _is_allowed_path(path_str, FILE_MANAGER_PREFIXES)
+
+
+def _is_staging_path(path_str: str) -> bool:
+    """True when the path lives inside the daemon's private staging directory.
+
+    Only content prepared by the unprivileged worker inside this directory may
+    be installed into the panel-owned roots, so the daemon can never be used to
+    copy an arbitrary root-only file (e.g. /etc/shadow) somewhere readable.
+    """
+    if not path_str or "\x00" in path_str:
+        return False
+    resolved = Path(os.path.realpath(path_str))
+    base = Path(os.path.realpath(TEMP_BASE))
+    if resolved == base or base not in resolved.parents:
+        return False
+    parent = resolved.parent
+    try:
+        info = parent.stat()
+    except OSError:
+        return False
+    if info.st_mode & 0o022:  # group/other writable
+        return False
+    try:
+        panel_uid = pwd.getpwnam("nexopanel").pw_uid
+    except KeyError:
+        panel_uid = -1
+    return info.st_uid in (0, panel_uid)
 
 
 def _is_flag(arg: str) -> bool:
@@ -414,6 +462,115 @@ def _validate_exec_args(args: list[str]) -> str | None:
     return validator(args[1:])
 
 
+# Maximum amount of data the daemon will read back for the API worker.
+MAX_PRIVILEGED_READ_BYTES = 32 * 1024 * 1024
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of *data* (os.write may write partially)."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _resolve_ids(owner: str | None, group: str | None) -> tuple[int, int] | None:
+    """Resolve optional owner/group names to uid/gid, or None if unknown."""
+    if not owner and not group:
+        return None
+    uid = gid = -1
+    if owner:
+        try:
+            uid = pwd.getpwnam(owner).pw_uid
+        except KeyError:
+            return None
+    if group:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            return None
+    return uid, gid
+
+
+def _chown_path(target: Path, owner: str | None, group: str | None) -> None:
+    """Best-effort ownership change; failures are not fatal."""
+    ids = _resolve_ids(owner, group)
+    if ids is None:
+        return
+    uid, gid = ids
+    try:
+        os.chown(target, uid, gid)
+    except OSError:
+        pass
+
+
+def _read_regular_file(path: Path, max_bytes: int = MAX_PRIVILEGED_READ_BYTES) -> bytes:
+    """Read a regular file without following symlinks."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        if info.st_size > max_bytes:
+            raise OSError(errno.EFBIG, "file too large")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _copy_tree_contents(src: Path, dst: Path) -> None:
+    """Copy the contents of *src* into *dst* without changing dst's own mode.
+
+    ``shutil.copytree`` would apply the source directory's mode to the
+    destination root (via copystat), which can make the destination unusable
+    for its new owner.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(src.iterdir()):
+        target = dst / entry.name
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            shutil.copytree(entry, target, dirs_exist_ok=True, symlinks=False)
+        else:
+            shutil.copy2(entry, target, follow_symlinks=False)
+
+
+def _ensure_owner_accessible(root: Path, owner: str | None, group: str | None) -> None:
+    """Make the installed tree usable by its owner and give it the right owner.
+
+    Archive entries may carry very restrictive modes (e.g. 0000) which would
+    leave the installed files unusable, so the owner always keeps read/write
+    access on directories and read/write on files.
+    """
+    for current, dirs, files in os.walk(root):
+        for name in dirs:
+            target = Path(current) / name
+            try:
+                os.chmod(target, (target.stat().st_mode & 0o777) | 0o700)
+            except OSError:
+                pass
+            _chown_path(target, owner, group)
+        for name in files:
+            target = Path(current) / name
+            try:
+                os.chmod(target, (target.stat().st_mode & 0o777) | 0o600)
+            except OSError:
+                pass
+            _chown_path(target, owner, group)
+    try:
+        os.chmod(root, (root.stat().st_mode & 0o777) | 0o700)
+    except OSError:
+        pass
+    _chown_path(root, owner, group)
+
+
 def _open_regular_file_for_write(target: Path, mode: int) -> int:
     """Open a file for writing without following symlinks.
 
@@ -518,7 +675,9 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
         owner = str(payload.get("owner", "www-data"))
         group = str(payload.get("group", "www-data"))
         mode = int(payload.get("mode", 0o755))
-        if not _is_allowed_path(path_str):
+        scope = payload.get("scope")
+        allowed = _is_file_manager_path(path_str) if scope == "file_manager" else _is_allowed_path(path_str)
+        if not allowed:
             return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
         p = Path(path_str)
         p.mkdir(parents=True, exist_ok=True)
@@ -530,6 +689,208 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
         except KeyError:
             pass
         return {"returncode": 0, "stdout": "created", "stderr": ""}
+
+    # --- File manager operations (the API worker is unprivileged and cannot
+    # always write the web roots directly) -------------------------------
+
+    if op == "write_bytes":
+        path_str = str(payload.get("path", ""))
+        content_b64 = str(payload.get("content_b64", ""))
+        mode = int(payload.get("mode", 0o644))
+        append = bool(payload.get("append", False))
+        owner = payload.get("owner")
+        group = payload.get("group")
+        if not _is_file_manager_path(path_str):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
+        if mode & 0o7000:
+            return {"returncode": 1, "stdout": "", "stderr": "setuid/setgid bits are not permitted"}
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            return {"returncode": 1, "stdout": "", "stderr": "Invalid base64 payload"}
+        target = Path(path_str)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Re-validate the parent after creating it: a symlinked parent must
+            # not be able to redirect the privileged write outside the roots.
+            if not _is_allowed_path(str(target.parent)):
+                return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
+            if append:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(target, flags, mode)
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise OSError(errno.EINVAL, "target is not a regular file")
+                    os.fchmod(fd, mode)
+                    _write_all(fd, data)
+                finally:
+                    os.close(fd)
+            else:
+                fd = _open_regular_file_for_write(target, mode)
+                try:
+                    _write_all(fd, data)
+                finally:
+                    os.close(fd)
+            _chown_path(target, owner, group)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Write failed: {exc.strerror or exc}"}
+        return {"returncode": 0, "stdout": "written", "stderr": ""}
+
+    if op == "read_file":
+        path_str = str(payload.get("path", ""))
+        if not _is_file_manager_path(path_str):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
+        try:
+            data = _read_regular_file(Path(path_str))
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Read failed: {exc.strerror or exc}"}
+        return {"returncode": 0, "stdout": base64.b64encode(data).decode("ascii"), "stderr": ""}
+
+    if op == "move_item":
+        source = str(payload.get("source", ""))
+        destination = str(payload.get("destination", ""))
+        owner = payload.get("owner")
+        group = payload.get("group")
+        if not _is_file_manager_path(source) or not _is_file_manager_path(destination):
+            return {"returncode": 1, "stdout": "", "stderr": "Path not permitted"}
+        src = Path(source)
+        dst = Path(destination)
+        if not src.exists():
+            return {"returncode": 1, "stdout": "", "stderr": f"Source not found: {source}"}
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Move failed: {exc.strerror or exc}"}
+        if owner or group:
+            if dst.is_dir():
+                for root, dirs, files in os.walk(dst):
+                    for name in dirs + files:
+                        _chown_path(Path(root) / name, owner, group)
+            _chown_path(dst, owner, group)
+        return {"returncode": 0, "stdout": "moved", "stderr": ""}
+
+    if op == "copy_item":
+        source = str(payload.get("source", ""))
+        destination = str(payload.get("destination", ""))
+        owner = payload.get("owner")
+        group = payload.get("group")
+        if not _is_file_manager_path(source) or not _is_file_manager_path(destination):
+            return {"returncode": 1, "stdout": "", "stderr": "Path not permitted"}
+        src = Path(source)
+        dst = Path(destination)
+        if not src.exists():
+            return {"returncode": 1, "stdout": "", "stderr": f"Source not found: {source}"}
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=False)
+            else:
+                shutil.copy2(src, dst)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Copy failed: {exc.strerror or exc}"}
+        if owner or group:
+            if dst.is_dir():
+                for root, dirs, files in os.walk(dst):
+                    for name in dirs + files:
+                        _chown_path(Path(root) / name, owner, group)
+            _chown_path(dst, owner, group)
+        return {"returncode": 0, "stdout": "copied", "stderr": ""}
+
+    if op == "chmod_item":
+        path_str = str(payload.get("path", ""))
+        mode = int(payload.get("mode", 0o644))
+        if not _is_file_manager_path(path_str):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
+        if mode & 0o7000:
+            return {"returncode": 1, "stdout": "", "stderr": "setuid/setgid bits are not permitted"}
+        target = Path(path_str)
+        if not target.exists():
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not found: {path_str}"}
+        try:
+            os.chmod(target, mode)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"chmod failed: {exc.strerror or exc}"}
+        return {"returncode": 0, "stdout": "chmod", "stderr": ""}
+
+    if op == "remove_item":
+        path_str = str(payload.get("path", ""))
+        target = Path(path_str)
+        # The parent must be inside the roots so a symlink (which must not be
+        # followed) can still be unlinked, while its target stays untouched.
+        if not _is_file_manager_path(path_str) and not _is_file_manager_path(str(target.parent)):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {path_str}"}
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Remove failed: {exc.strerror or exc}"}
+        return {"returncode": 0, "stdout": "removed", "stderr": ""}
+
+    if op == "install_file":
+        # Copy a single regular file (produced by the unprivileged worker in a
+        # private temp directory) into one of the panel-owned roots.
+        source = str(payload.get("source", ""))
+        destination = str(payload.get("destination", ""))
+        mode = int(payload.get("mode", 0o644))
+        owner = payload.get("owner")
+        group = payload.get("group")
+        if not _is_file_manager_path(destination):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {destination}"}
+        if not _is_staging_path(source):
+            return {"returncode": 1, "stdout": "", "stderr": f"Staging path not permitted: {source}"}
+        if mode & 0o7000:
+            return {"returncode": 1, "stdout": "", "stderr": "setuid/setgid bits are not permitted"}
+        try:
+            data = _read_regular_file(Path(source))
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Read failed: {exc.strerror or exc}"}
+        dst = Path(destination)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not _is_file_manager_path(str(dst.parent)):
+                return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {destination}"}
+            fd = _open_regular_file_for_write(dst, mode)
+            try:
+                _write_all(fd, data)
+            finally:
+                os.close(fd)
+            _chown_path(dst, owner, group)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Install failed: {exc.strerror or exc}"}
+        return {"returncode": 0, "stdout": "installed", "stderr": ""}
+
+    if op == "install_tree":
+        # Copy a directory tree (produced by the unprivileged worker in a
+        # private temp directory) into one of the panel-owned roots.
+        source = str(payload.get("source", ""))
+        destination = str(payload.get("destination", ""))
+        owner = payload.get("owner")
+        group = payload.get("group")
+        if not _is_file_manager_path(destination):
+            return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {destination}"}
+        if not _is_staging_path(source):
+            return {"returncode": 1, "stdout": "", "stderr": f"Staging path not permitted: {source}"}
+        src = Path(source)
+        if src.is_symlink() or not src.is_dir():
+            return {"returncode": 1, "stdout": "", "stderr": "Source is not a directory"}
+        # Never follow symlinks out of the source tree.
+        for root, dirs, files in os.walk(src):
+            for name in list(dirs) + list(files):
+                if (Path(root) / name).is_symlink():
+                    return {"returncode": 1, "stdout": "", "stderr": "Refusing to install a tree containing symlinks"}
+        dst = Path(destination)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not _is_file_manager_path(str(dst.parent)):
+                return {"returncode": 1, "stdout": "", "stderr": f"Path not permitted: {destination}"}
+            _copy_tree_contents(src, dst)
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Install failed: {exc.strerror or exc}"}
+        _ensure_owner_accessible(dst, owner, group)
+        return {"returncode": 0, "stdout": "installed", "stderr": ""}
 
     return {"returncode": 1, "stdout": "", "stderr": f"Unknown operation: {op}"}
 
@@ -562,11 +923,22 @@ async def main() -> None:
     finally:
         os.umask(previous_umask)
     os.chmod(SOCKET_PATH, 0o600)
+    uid: int | None = None
+    gid: int | None = None
     try:
         uid = pwd.getpwnam("nexopanel").pw_uid
         gid = grp.getgrnam("nexopanel").gr_gid
         os.chown(SOCKET_PATH, uid, gid)
     except KeyError:
+        pass
+    # Private staging directory shared with the unprivileged worker: only
+    # content placed here may be installed into the panel-owned roots.
+    try:
+        TEMP_BASE.mkdir(parents=True, exist_ok=True)
+        os.chmod(TEMP_BASE, 0o700)
+        if uid is not None and gid is not None:
+            os.chown(TEMP_BASE, uid, gid)
+    except OSError:
         pass
     async with server:
         await server.serve_forever()
