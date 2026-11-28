@@ -459,8 +459,15 @@ async def sync_databases_from_server(
         if res.ok and "[mock" not in res.stdout:
             discovered = [line.strip() for line in res.stdout.splitlines() if line.strip() and line.strip() not in system_dbs]
 
-    added = 0
+    validated: list[str] = []
     for name in discovered:
+        try:
+            validated.append(validate_db_identifier(name))
+        except ValueError:
+            continue
+
+    added = 0
+    for name in validated:
         exists = (
             await db.execute(select(ManagedDatabase).where(ManagedDatabase.engine == engine, ManagedDatabase.db_name == name))
         ).scalar_one_or_none()
@@ -651,7 +658,7 @@ async def run_database_tool_action(
         raise HTTPException(status_code=404, detail="Database not found")
 
     executor = get_node_executor()
-    tbl = body.table_name
+    tbl = validate_db_identifier(body.table_name)
     if rec.engine == "mariadb":
         if body.action == "repair":
             sql = f"REPAIR TABLE `{rec.db_name}`.`{tbl}`;"

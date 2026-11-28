@@ -140,6 +140,9 @@ DB_CLIENT_FLAGS = {
     "-d",
     "--dbname",
     "--tuples-only",
+    "-B",
+    "-F",
+    "--field-separator",
 }
 
 DOCKER_ACTIONS = {"ps", "images", "pull", "start", "stop", "restart", "rm", "logs", "inspect"}
@@ -311,6 +314,10 @@ def _validate_db_client(args: list[str], *, allow_sql: bool = True) -> str | Non
         if arg in {"-U", "--username", "-d", "--dbname"}:
             skip_next = True
             value_flag = arg
+            continue
+        if arg in {"-F", "--field-separator"}:
+            skip_next = True
+            value_flag = "raw"
             continue
         if _is_flag(arg):
             if arg not in DB_CLIENT_FLAGS and arg not in {"-f"} and not arg.startswith("--format="):
