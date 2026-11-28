@@ -10,6 +10,13 @@
         Domain
       </button>
       <button
+        @click="activeSection = 'nameserver'; loadNameservers()"
+        :class="activeSection === 'nameserver' ? 'text-emerald-600 bg-emerald-50/70 border-r-2 border-emerald-600 font-semibold' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'"
+        class="w-full text-left px-4 py-2.5 transition-colors"
+      >
+        Nameserver
+      </button>
+      <button
         @click="activeSection = 'certificate'; loadCertificates()"
         :class="activeSection === 'certificate' ? 'text-emerald-600 bg-emerald-50/70 border-r-2 border-emerald-600 font-semibold' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'"
         class="w-full text-left px-4 py-2.5 transition-colors"
@@ -42,12 +49,16 @@
 
         <!-- TAB 1: PROVIDER LIST -->
         <div v-if="activeTab === 'providers'" class="space-y-3">
+          <div class="rounded border border-sky-200 bg-sky-50 px-3 py-2 text-[11px] text-sky-800">
+            <span class="font-semibold">Local BIND9</span> is the authoritative DNS engine used by this panel.
+            External provider credentials are stored securely for reference only and are not yet used to sync records.
+          </div>
           <div class="flex items-center justify-between">
             <button @click="showProviderModal = true" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-medium flex items-center gap-1.5">
               <Plus class="w-3.5 h-3.5" />
               <span>Add DNS Provider</span>
             </button>
-            <span class="text-slate-500 text-[11px]">Configure Local BIND9 or external DNS API providers (Cloudflare, NameCheap, DigitalOcean).</span>
+            <span class="text-slate-500 text-[11px]">Store API credentials for Cloudflare, NameCheap, DigitalOcean and more.</span>
           </div>
 
           <div class="border border-slate-200 rounded overflow-hidden">
@@ -69,9 +80,13 @@
                   </td>
                   <td class="font-mono text-[11px] text-slate-500">{{ p.api_token }}</td>
                   <td>
-                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">
+                    <span v-if="p.is_builtin" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">
                       <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                      Active
+                      Active (authoritative)
+                    </span>
+                    <span v-else class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[11px] font-medium">
+                      <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+                      Credentials stored
                     </span>
                   </td>
                   <td class="text-right">
@@ -100,6 +115,14 @@
                 <RefreshCw :class="{ 'animate-spin': pulling }" class="w-3.5 h-3.5" />
                 <span>Pull Data</span>
               </button>
+              <button
+                @click="testAllZones"
+                :disabled="testingAll || zones.length === 0"
+                class="px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-medium flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <ShieldCheck :class="{ 'animate-pulse': testingAll }" class="w-3.5 h-3.5" />
+                <span>{{ testingAll ? 'Testing…' : 'Test All' }}</span>
+              </button>
               <button @click="openPullLogs" class="px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-medium">
                 Pull Log
               </button>
@@ -125,7 +148,8 @@
                 <tr class="bg-slate-50">
                   <th>Domain</th>
                   <th>SSL</th>
-                  <th>Number of Resolutions</th>
+                  <th>Records</th>
+                  <th>DNS Health</th>
                   <th>Expiration Time</th>
                   <th class="text-right">Operate</th>
                 </tr>
@@ -140,21 +164,28 @@
                   </td>
                   <td>
                     <span v-if="z.ssl_status === 'active'" class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[11px] font-medium">
-                      🔒 Active
+                      Active
                     </span>
                     <span v-else class="text-slate-400">--</span>
                   </td>
                   <td class="font-mono text-slate-700">{{ z.record_count ?? 0 }}</td>
+                  <td>
+                    <span :class="healthBadge(z).cls" class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium">
+                      <span class="w-1.5 h-1.5 rounded-full" :class="healthBadge(z).dot"></span>
+                      {{ healthBadge(z).label }}
+                    </span>
+                  </td>
                   <td class="text-slate-500 text-[11px]">
                     {{ z.ssl_expires_at ? formatDate(z.ssl_expires_at) : '-' }}
                   </td>
                   <td class="text-right space-x-3">
+                    <button @click="testZone(z)" class="text-sky-600 hover:underline font-medium">Test</button>
                     <button @click="enterManage(z)" class="text-emerald-600 hover:underline font-medium">Manage</button>
                     <button @click="deleteZone(z)" class="text-rose-600 hover:underline">Delete</button>
                   </td>
                 </tr>
                 <tr v-if="filteredZones.length === 0">
-                  <td colspan="5" class="p-8 text-center text-slate-400">
+                  <td colspan="6" class="p-8 text-center text-slate-400">
                     No domains found. Click <button @click="openZoneModal" class="text-emerald-600 underline font-medium">+ Add Domain</button> to create your first DNS zone.
                   </td>
                 </tr>
@@ -211,6 +242,10 @@
               <button @click="openAddRecord" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-medium">
                 Add Resolution
               </button>
+              <button @click="testZone(managingZone)" class="px-3 py-1.5 rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 font-medium flex items-center gap-1.5">
+                <ShieldCheck class="w-3.5 h-3.5" />
+                <span>Test DNS</span>
+              </button>
               <button @click="managingZone = null" class="px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-medium">
                 Return
               </button>
@@ -227,8 +262,7 @@
                   <th>Type</th>
                   <th>Record Value</th>
                   <th>TTL</th>
-                  <th>Proxy</th>
-                  <th>Remark</th>
+                  <th>Priority</th>
                   <th class="text-right">Operate</th>
                 </tr>
               </thead>
@@ -243,20 +277,20 @@
                   <td class="font-mono text-[11px] text-slate-700">
                     <div class="flex items-center gap-1.5">
                       <span class="truncate max-w-xs" :title="r.value">{{ r.value }}</span>
-                      <span v-if="r.priority !== null && r.priority !== undefined" class="text-[10px] text-slate-400">(Pri: {{ r.priority }})</span>
-                      <button @click="copyValue(r.value)" class="text-emerald-600 hover:text-emerald-700 text-[10px]" title="Copy Value">📋</button>
+                      <button @click="copyText(r.value, `rec-${r.id}`)" class="text-emerald-600 hover:text-emerald-700 text-[10px]" title="Copy Value">
+                        {{ copiedKey === `rec-${r.id}` ? 'Copied' : 'Copy' }}
+                      </button>
                     </div>
                   </td>
                   <td class="text-slate-600">{{ r.ttl === 300 ? 'Auto (300s)' : `${r.ttl}s` }}</td>
-                  <td class="text-slate-400">--</td>
-                  <td class="text-slate-500 text-[11px]">NexoPanel DNS Manager Sync</td>
+                  <td class="text-slate-500">{{ r.priority ?? '—' }}</td>
                   <td class="text-right space-x-2.5">
                     <button @click="openEditRecord(r)" class="text-emerald-600 hover:underline font-medium">Edit</button>
                     <button @click="deleteRecord(r.id)" class="text-rose-600 hover:underline">Delete</button>
                   </td>
                 </tr>
                 <tr v-if="filteredRecords.length === 0">
-                  <td colspan="7" class="p-8 text-center text-slate-400">
+                  <td colspan="6" class="p-8 text-center text-slate-400">
                     No DNS resolutions found for {{ managingZone.domain }}.
                   </td>
                 </tr>
@@ -278,6 +312,174 @@
             </select>
             <span>Total {{ filteredRecords.length }}</span>
           </div>
+        </div>
+      </div>
+
+      <!-- NAMESERVER SECTION -->
+      <div v-else-if="activeSection === 'nameserver'" class="space-y-4 flex-1 overflow-y-auto">
+        <div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 pb-3">
+          <div>
+            <h2 class="text-sm font-bold text-slate-900">Nameserver & DNS Setup</h2>
+            <p class="text-[11px] text-slate-500">
+              Publish these nameservers at your domain registrar, then verify that delegation is working.
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button @click="loadNameservers" class="np-btn-secondary">
+              <RefreshCw class="w-3.5 h-3.5" />
+              <span>Refresh</span>
+            </button>
+            <button @click="openNsModal" class="np-btn-primary">
+              <Pencil class="w-3.5 h-3.5" />
+              <span>Edit Nameservers</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Status cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div class="np-card p-3">
+            <div class="flex items-center gap-1.5 text-slate-500">
+              <Server class="w-3.5 h-3.5" />
+              <span class="text-[10px] font-semibold uppercase tracking-wider">Server IP</span>
+            </div>
+            <div class="flex items-center justify-between mt-1.5">
+              <span class="font-mono text-sm font-semibold text-slate-900">{{ nameservers?.server_ip || '—' }}</span>
+              <button v-if="nameservers?.server_ip" @click="copyText(nameservers.server_ip, 'ip')" class="text-emerald-600 hover:underline text-[10px]">
+                {{ copiedKey === 'ip' ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+          </div>
+          <div class="np-card p-3">
+            <div class="flex items-center gap-1.5 text-slate-500">
+              <ShieldCheck class="w-3.5 h-3.5" />
+              <span class="text-[10px] font-semibold uppercase tracking-wider">BIND9 Engine</span>
+            </div>
+            <div class="mt-1.5">
+              <span
+                :class="nameservers?.bind_healthy ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium"
+              >
+                <span class="w-1.5 h-1.5 rounded-full" :class="nameservers?.bind_healthy ? 'bg-emerald-500' : 'bg-rose-500'"></span>
+                {{ nameservers?.bind_status || 'unknown' }}
+              </span>
+            </div>
+          </div>
+          <div class="np-card p-3">
+            <div class="flex items-center gap-1.5 text-slate-500">
+              <Network class="w-3.5 h-3.5" />
+              <span class="text-[10px] font-semibold uppercase tracking-wider">Primary Nameserver</span>
+            </div>
+            <div class="flex items-center justify-between mt-1.5">
+              <span class="font-mono text-xs font-semibold text-slate-900 truncate" :title="nameservers?.ns1">{{ nameservers?.ns1 || '—' }}</span>
+              <button v-if="nameservers?.ns1" @click="copyText(nameservers.ns1, 'ns1')" class="text-emerald-600 hover:underline text-[10px] shrink-0 ml-2">
+                {{ copiedKey === 'ns1' ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+          </div>
+          <div class="np-card p-3">
+            <div class="flex items-center gap-1.5 text-slate-500">
+              <Network class="w-3.5 h-3.5" />
+              <span class="text-[10px] font-semibold uppercase tracking-wider">Secondary Nameserver</span>
+            </div>
+            <div class="flex items-center justify-between mt-1.5">
+              <span class="font-mono text-xs font-semibold text-slate-900 truncate" :title="nameservers?.ns2">{{ nameservers?.ns2 || '—' }}</span>
+              <button v-if="nameservers?.ns2" @click="copyText(nameservers.ns2, 'ns2')" class="text-emerald-600 hover:underline text-[10px] shrink-0 ml-2">
+                {{ copiedKey === 'ns2' ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <!-- How to add a domain / nameserver -->
+          <div class="np-card p-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-600 mb-2">How to add DNS & nameservers</h3>
+            <ol class="space-y-2.5 text-[11px] text-slate-600">
+              <li class="flex gap-2">
+                <span class="w-4 h-4 rounded-full bg-emerald-100 text-emerald-700 font-bold text-[10px] flex items-center justify-center shrink-0">1</span>
+                <span>Open <button @click="activeSection = 'domain'; activeTab = 'domains'" class="text-emerald-600 underline font-medium">Domain Management</button> and click <span class="font-medium">+ Add Domain</span>. This creates the BIND9 zone and its first NS record.</span>
+              </li>
+              <li class="flex gap-2">
+                <span class="w-4 h-4 rounded-full bg-emerald-100 text-emerald-700 font-bold text-[10px] flex items-center justify-center shrink-0">2</span>
+                <span>Add an <span class="font-mono font-medium">A</span> record with host <span class="font-mono font-medium">@</span> pointing to <span class="font-mono">{{ nameservers?.server_ip || 'your server IP' }}</span> so the bare domain resolves.</span>
+              </li>
+              <li class="flex gap-2">
+                <span class="w-4 h-4 rounded-full bg-emerald-100 text-emerald-700 font-bold text-[10px] flex items-center justify-center shrink-0">3</span>
+                <span>If your nameservers are subdomains of the domain (e.g. <span class="font-mono">ns1.example.com</span>), create <span class="font-mono">A</span> records for <span class="font-mono">ns1</span> and <span class="font-mono">ns2</span> at your registrar as <span class="font-medium">glue records</span> pointing to the server IP.</span>
+              </li>
+              <li class="flex gap-2">
+                <span class="w-4 h-4 rounded-full bg-emerald-100 text-emerald-700 font-bold text-[10px] flex items-center justify-center shrink-0">4</span>
+                <span>At your registrar, set the domain's nameservers to <span class="font-mono">{{ nameservers?.ns1 || 'ns1' }}</span> and <span class="font-mono">{{ nameservers?.ns2 || 'ns2' }}</span>.</span>
+              </li>
+              <li class="flex gap-2">
+                <span class="w-4 h-4 rounded-full bg-emerald-100 text-emerald-700 font-bold text-[10px] flex items-center justify-center shrink-0">5</span>
+                <span>Wait for propagation (minutes up to 48h), then click <span class="font-medium">Test</span> below. Any failed check shows a fix hint.</span>
+              </li>
+            </ol>
+          </div>
+
+          <!-- Common fixes -->
+          <div class="np-card p-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-600 mb-2">Troubleshooting & fixes</h3>
+            <div class="space-y-2 text-[11px]">
+              <div class="rounded border border-slate-200 bg-slate-50 p-2">
+                <p class="font-semibold text-slate-800">Domain does not resolve</p>
+                <p class="text-slate-600 mt-0.5">Confirm the apex <span class="font-mono">A</span> record points to the server IP and that the domain is delegated to your nameservers at the registrar.</p>
+              </div>
+              <div class="rounded border border-slate-200 bg-slate-50 p-2">
+                <p class="font-semibold text-slate-800">BIND9 is inactive</p>
+                <p class="text-slate-600 mt-0.5">Run <span class="font-mono">systemctl start named && systemctl enable named</span>, then re-test.</p>
+              </div>
+              <div class="rounded border border-slate-200 bg-slate-50 p-2">
+                <p class="font-semibold text-slate-800">NS mismatch</p>
+                <p class="text-slate-600 mt-0.5">The nameservers at the registrar must match the <span class="font-mono">NS</span> records in the zone. Update either side and allow the TTL to expire.</p>
+              </div>
+              <div class="rounded border border-slate-200 bg-slate-50 p-2">
+                <p class="font-semibold text-slate-800">Zone file rejected</p>
+                <p class="text-slate-600 mt-0.5">Correct the highlighted record, click <span class="font-medium">Pull Data</span> to regenerate the zone file, then re-test.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Zone readiness -->
+        <div class="np-card overflow-hidden">
+          <div class="px-4 py-2.5 border-b border-slate-200 flex items-center justify-between">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-600">Zone readiness</h3>
+            <button @click="testAllZones" :disabled="testingAll || zones.length === 0" class="np-btn-secondary disabled:opacity-50">
+              <ShieldCheck :class="{ 'animate-pulse': testingAll }" class="w-3.5 h-3.5" />
+              <span>{{ testingAll ? 'Testing…' : 'Test all zones' }}</span>
+            </button>
+          </div>
+          <table class="np-table">
+            <thead>
+              <tr class="bg-slate-50">
+                <th>Domain</th>
+                <th>Records</th>
+                <th>Health</th>
+                <th class="text-right">Operate</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="z in zones" :key="z.id">
+                <td class="font-semibold text-slate-800">{{ z.domain }}</td>
+                <td class="font-mono">{{ z.record_count ?? 0 }}</td>
+                <td>
+                  <span :class="healthBadge(z).cls" class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium">
+                    <span class="w-1.5 h-1.5 rounded-full" :class="healthBadge(z).dot"></span>
+                    {{ healthBadge(z).label }}
+                  </span>
+                </td>
+                <td class="text-right">
+                  <button @click="testZone(z)" class="text-sky-600 hover:underline font-medium">Run test</button>
+                </td>
+              </tr>
+              <tr v-if="zones.length === 0">
+                <td colspan="4" class="p-6 text-center text-slate-400">No DNS zones yet. Add a domain to begin.</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -327,21 +529,36 @@
     <div v-if="showZoneModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div class="bg-white rounded-lg shadow-xl p-5 w-full max-w-md space-y-3">
         <h3 class="text-sm font-bold text-slate-900">Add Domain Zone</h3>
+        <div v-if="zoneError" class="p-2.5 rounded bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-start gap-2">
+          <svg class="w-4 h-4 text-rose-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+          <span class="break-all">{{ zoneError }}</span>
+        </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Domain Name</label>
-          <input v-model="newZone.domain" placeholder="example.com" class="np-input" />
+          <input v-model="newZone.domain" @input="onDomainChange" placeholder="example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Primary Nameserver</label>
-          <input v-model="newZone.primary_ns" placeholder="ns1.example.com" class="np-input" />
+          <input v-model="newZone.primary_ns" placeholder="ns1.example.com" class="np-input" :disabled="creatingZone" />
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-slate-600 mb-1">Secondary Nameserver <span class="text-slate-400">(recommended)</span></label>
+          <input v-model="newZone.secondary_ns" placeholder="ns2.example.com" class="np-input" :disabled="creatingZone" />
         </div>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Admin Email</label>
-          <input v-model="newZone.admin_email" placeholder="hostmaster@example.com" class="np-input" />
+          <input v-model="newZone.admin_email" placeholder="hostmaster@example.com" class="np-input" :disabled="creatingZone" />
+        </div>
+        <div class="flex items-center gap-2 pt-1 pb-1">
+          <input id="create_default_recs" v-model="newZone.create_default_records" type="checkbox" class="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+          <label for="create_default_recs" class="text-[11px] text-slate-700 font-medium">Create default records (@ A, www, mail, ftp, MX, SPF)</label>
         </div>
         <div class="flex justify-end gap-2 pt-2">
-          <button @click="showZoneModal = false" class="np-btn-secondary">Cancel</button>
-          <button @click="createZone" class="np-btn-primary">Create Zone</button>
+          <button @click="showZoneModal = false" :disabled="creatingZone" class="np-btn-secondary">Cancel</button>
+          <button @click="createZone" :disabled="creatingZone" class="np-btn-primary inline-flex items-center gap-1.5">
+            <svg v-if="creatingZone" class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+            <span>{{ creatingZone ? 'Creating Zone...' : 'Create Zone' }}</span>
+          </button>
         </div>
       </div>
     </div>
@@ -391,6 +608,9 @@
     <div v-if="showProviderModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div class="bg-white rounded-lg shadow-xl p-5 w-full max-w-md space-y-3">
         <h3 class="text-sm font-bold text-slate-900">Add DNS Provider</h3>
+        <p class="text-[11px] text-slate-500">
+          Credentials are encrypted at rest. Local BIND9 remains the authoritative engine for this panel.
+        </p>
         <div>
           <label class="block text-[11px] font-medium text-slate-600 mb-1">Account / Label Name</label>
           <input v-model="newProvider.name" placeholder="e.g. Cloudflare Main" class="np-input" />
@@ -413,6 +633,110 @@
         <div class="flex justify-end gap-2 pt-2">
           <button @click="showProviderModal = false" class="np-btn-secondary">Cancel</button>
           <button @click="createProvider" class="np-btn-primary">Save Provider</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Edit Nameservers -->
+    <div v-if="showNsModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div class="bg-white rounded-lg shadow-xl p-5 w-full max-w-md space-y-3">
+        <h3 class="text-sm font-bold text-slate-900">Edit Nameservers</h3>
+        <p class="text-[11px] text-slate-500">
+          Use the exact hostnames you will register as nameservers at your domain registrar.
+        </p>
+        <div v-if="nsError" class="rounded bg-rose-50 border border-rose-200 px-2.5 py-1.5 text-[11px] text-rose-700">
+          {{ nsError }}
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-slate-600 mb-1">Server Public IP</label>
+          <input v-model="nsForm.public_ip" placeholder="203.0.113.10" class="np-input font-mono" />
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-slate-600 mb-1">Primary Nameserver (NS1)</label>
+          <input v-model="nsForm.ns1" placeholder="ns1.example.com" class="np-input font-mono" />
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-slate-600 mb-1">Secondary Nameserver (NS2)</label>
+          <input v-model="nsForm.ns2" placeholder="ns2.example.com" class="np-input font-mono" />
+        </div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button @click="showNsModal = false" class="np-btn-secondary">Cancel</button>
+          <button @click="saveNameservers" :disabled="savingNs" class="np-btn-primary disabled:opacity-50">
+            {{ savingNs ? 'Saving…' : 'Save Nameservers' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: DNS Health Report -->
+    <div v-if="showHealthModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div class="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+        <div class="flex items-start justify-between gap-3 border-b border-slate-200 p-4">
+          <div>
+            <h3 class="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <ShieldCheck class="w-4 h-4 text-emerald-600" />
+              DNS Health — <span class="font-mono">{{ healthZone?.domain }}</span>
+            </h3>
+            <p class="text-[11px] text-slate-500 mt-0.5">
+              Live diagnostics for zone file, BIND9 service, records and public delegation.
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button @click="healthZone && runZoneCheck(healthZone)" :disabled="healthLoading" class="np-btn-secondary disabled:opacity-50">
+              <RefreshCw :class="{ 'animate-spin': healthLoading }" class="w-3.5 h-3.5" />
+              <span>{{ healthLoading ? 'Testing…' : 'Re-run' }}</span>
+            </button>
+            <button @click="showHealthModal = false" class="np-btn-secondary">Close</button>
+          </div>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 space-y-3">
+          <div v-if="healthError" class="rounded bg-rose-50 border border-rose-200 px-3 py-2 text-[11px] text-rose-700">
+            {{ healthError }}
+          </div>
+
+          <div v-if="healthResult" class="space-y-3">
+            <!-- Overall banner -->
+            <div :class="overallBannerClass(healthResult.overall)" class="rounded border p-3 flex items-center justify-between gap-3">
+              <div class="flex items-center gap-2">
+                <component :is="statusIcon(healthResult.overall)" :class="statusIconClass(healthResult.overall)" class="w-5 h-5" />
+                <div>
+                  <p class="text-sm font-bold">{{ overallLabel(healthResult.overall) }}</p>
+                  <p class="text-[11px] opacity-80">
+                    {{ healthResult.summary.pass }} passed · {{ healthResult.summary.warn }} warning(s) · {{ healthResult.summary.fail }} failed
+                  </p>
+                </div>
+              </div>
+              <span class="text-[10px] font-mono opacity-70">{{ formatDate(healthResult.checked_at) }}</span>
+            </div>
+
+            <!-- Checks -->
+            <div class="border border-slate-200 rounded overflow-hidden">
+              <div v-for="c in healthResult.checks" :key="c.id" class="flex items-start gap-3 p-3 border-b border-slate-100 last:border-b-0">
+                <component :is="statusIcon(c.status)" :class="statusIconClass(c.status)" class="w-4 h-4 mt-0.5 shrink-0" />
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-2">
+                    <p class="text-xs font-semibold text-slate-800">{{ c.label }}</p>
+                    <span :class="statusBadgeClass(c.status)" class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase">{{ c.status }}</span>
+                  </div>
+                  <p class="text-[11px] text-slate-600 mt-0.5 break-words">{{ c.detail }}</p>
+                  <div v-if="c.fix" class="mt-1.5 rounded bg-amber-50 border border-amber-200 px-2 py-1.5">
+                    <p class="text-[10px] font-semibold text-amber-800 uppercase tracking-wide">How to fix</p>
+                    <p class="text-[11px] text-amber-900 mt-0.5">{{ c.fix }}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <p class="text-[10px] text-slate-400">
+              Tip: public DNS changes can take up to the record TTL (and up to 48h after changing registrar nameservers) to propagate.
+            </p>
+          </div>
+
+          <div v-else-if="healthLoading" class="flex flex-col items-center justify-center py-12 text-slate-400">
+            <RefreshCw class="w-6 h-6 animate-spin mb-2" />
+            <span class="text-[11px]">Running DNS diagnostics…</span>
+          </div>
         </div>
       </div>
     </div>
@@ -457,11 +781,24 @@
 </template>
 
 <script setup lang="ts">
-import { Globe, Plus, RefreshCw, Search } from 'lucide-vue-next'
+import {
+  CheckCircle2,
+  Globe,
+  Info,
+  Network,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Search,
+  Server,
+  ShieldCheck,
+  XCircle,
+  AlertTriangle,
+} from 'lucide-vue-next'
 
 const { apiFetch } = useApi()
 
-const activeSection = ref<'domain' | 'certificate'>('domain')
+const activeSection = ref<'domain' | 'nameserver' | 'certificate'>('domain')
 const activeTab = ref<'providers' | 'domains'>('domains')
 
 const providers = ref<any[]>([])
@@ -471,6 +808,7 @@ const managingZone = ref<any>(null)
 const records = ref<any[]>([])
 const certs = ref<any[]>([])
 const dnsLogs = ref<any[]>([])
+const nameservers = ref<any>(null)
 
 const domainSearch = ref('')
 const recordSearch = ref('')
@@ -484,9 +822,32 @@ const showZoneModal = ref(false)
 const showRecModal = ref(false)
 const showProviderModal = ref(false)
 const showLogsModal = ref(false)
+const showNsModal = ref(false)
 const editingRecordId = ref<number | null>(null)
 
-const newZone = reactive({ domain: '', primary_ns: 'ns1.localhost.localdomain', admin_email: 'hostmaster@localhost.localdomain' })
+const nsForm = reactive({ public_ip: '', ns1: '', ns2: '' })
+const savingNs = ref(false)
+const nsError = ref('')
+const copiedKey = ref('')
+
+const showHealthModal = ref(false)
+const healthZone = ref<any>(null)
+const healthResult = ref<any>(null)
+const healthLoading = ref(false)
+const healthError = ref('')
+const healthCache = ref<Record<number, any>>({})
+const testingAll = ref(false)
+
+const creatingZone = ref(false)
+const zoneError = ref('')
+
+const newZone = reactive({
+  domain: '',
+  primary_ns: 'ns1.localhost.localdomain',
+  secondary_ns: '',
+  admin_email: 'hostmaster@localhost.localdomain',
+  create_default_records: true,
+})
 const recForm = reactive<{ name: string; record_type: string; value: string; ttl: number; priority: number | null }>({
   name: '@',
   record_type: 'A',
@@ -530,6 +891,60 @@ function formatDate(iso: string) {
   return iso.replace('T', ' ').slice(0, 19)
 }
 
+function statusIcon(status: string) {
+  if (status === 'pass') return CheckCircle2
+  if (status === 'fail') return XCircle
+  if (status === 'warn') return AlertTriangle
+  return Info
+}
+
+function statusIconClass(status: string) {
+  if (status === 'pass') return 'text-emerald-600'
+  if (status === 'fail') return 'text-rose-600'
+  if (status === 'warn') return 'text-amber-600'
+  return 'text-sky-600'
+}
+
+function statusBadgeClass(status: string) {
+  if (status === 'pass') return 'bg-emerald-50 text-emerald-700'
+  if (status === 'fail') return 'bg-rose-50 text-rose-700'
+  if (status === 'warn') return 'bg-amber-50 text-amber-700'
+  return 'bg-sky-50 text-sky-700'
+}
+
+function overallLabel(overall: string) {
+  if (overall === 'pass') return 'All checks passed'
+  if (overall === 'warn') return 'DNS works with warnings'
+  return 'DNS has failures that need attention'
+}
+
+function overallBannerClass(overall: string) {
+  if (overall === 'pass') return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+  if (overall === 'warn') return 'border-amber-200 bg-amber-50 text-amber-800'
+  return 'border-rose-200 bg-rose-50 text-rose-800'
+}
+
+function healthBadge(z: any) {
+  const result = healthCache.value[z.id]
+  if (!result) return { label: 'Not tested', cls: 'bg-slate-100 text-slate-500', dot: 'bg-slate-400' }
+  if (result.overall === 'pass') return { label: 'Healthy', cls: 'bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' }
+  if (result.overall === 'warn') return { label: 'Warning', cls: 'bg-amber-50 text-amber-700', dot: 'bg-amber-500' }
+  return { label: 'Failed', cls: 'bg-rose-50 text-rose-700', dot: 'bg-rose-500' }
+}
+
+async function copyText(text: string, key?: string) {
+  if (!text || !navigator.clipboard) return
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key || text
+    setTimeout(() => {
+      if (copiedKey.value === (key || text)) copiedKey.value = ''
+    }, 1500)
+  } catch {
+    // Clipboard permission denied.
+  }
+}
+
 async function load() {
   const [zList, pList] = await Promise.all([
     apiFetch<any[]>('/dns/zones'),
@@ -537,6 +952,44 @@ async function load() {
   ])
   zones.value = zList || []
   providers.value = pList || []
+}
+
+async function loadNameservers() {
+  try {
+    nameservers.value = await apiFetch('/dns/nameservers')
+    nsForm.public_ip = nameservers.value.server_ip
+    nsForm.ns1 = nameservers.value.ns1
+    nsForm.ns2 = nameservers.value.ns2
+  } catch {
+    nameservers.value = null
+  }
+}
+
+function openNsModal() {
+  nsError.value = ''
+  if (nameservers.value) {
+    nsForm.public_ip = nameservers.value.server_ip
+    nsForm.ns1 = nameservers.value.ns1
+    nsForm.ns2 = nameservers.value.ns2
+  }
+  showNsModal.value = true
+}
+
+async function saveNameservers() {
+  nsError.value = ''
+  savingNs.value = true
+  try {
+    await apiFetch('/dns/nameservers', {
+      method: 'PUT',
+      body: { public_ip: nsForm.public_ip.trim(), ns1: nsForm.ns1.trim(), ns2: nsForm.ns2.trim() },
+    })
+    showNsModal.value = false
+    await loadNameservers()
+  } catch (err: any) {
+    nsError.value = err?.message || 'Failed to save nameservers'
+  } finally {
+    savingNs.value = false
+  }
 }
 
 async function loadCertificates() {
@@ -565,23 +1018,45 @@ async function refreshRecords() {
   records.value = await apiFetch<any[]>(`/dns/zones/${managingZone.value.id}/records`)
 }
 
+function onDomainChange() {
+  const d = (newZone.domain || '').trim().toLowerCase()
+  if (d && (!newZone.admin_email || newZone.admin_email.includes('localhost.localdomain') || newZone.admin_email.startsWith('hostmaster@'))) {
+    newZone.admin_email = `hostmaster@${d}`
+  }
+}
+
 function openZoneModal() {
+  zoneError.value = ''
   newZone.domain = ''
-  newZone.primary_ns = 'ns1.localhost.localdomain'
+  newZone.primary_ns = nameservers.value?.ns1 || 'ns1.localhost.localdomain'
+  newZone.secondary_ns = nameservers.value?.ns2 || ''
   newZone.admin_email = 'hostmaster@localhost.localdomain'
+  newZone.create_default_records = true
   showZoneModal.value = true
 }
 
 async function createZone() {
-  await apiFetch('/dns/zones', { method: 'POST', body: newZone })
-  showZoneModal.value = false
-  await load()
+  if (!newZone.domain || !newZone.domain.trim()) {
+    zoneError.value = 'Domain name is required.'
+    return
+  }
+  zoneError.value = ''
+  creatingZone.value = true
+  try {
+    await apiFetch('/dns/zones', { method: 'POST', body: newZone })
+    showZoneModal.value = false
+    await Promise.all([load(), loadNameservers()])
+  } catch (err: any) {
+    zoneError.value = err.message || 'Failed to create DNS zone. Please check named status and try again.'
+  } finally {
+    creatingZone.value = false
+  }
 }
 
 async function deleteZone(z: any) {
   if (!confirm(`Delete DNS zone ${z.domain} and all its records?`)) return
   await apiFetch(`/dns/zones/${z.id}`, { method: 'DELETE' })
-  await load()
+  await Promise.all([load(), loadNameservers()])
 }
 
 function openAddRecord() {
@@ -620,21 +1095,21 @@ async function saveRecord() {
   }
   showRecModal.value = false
   await refreshRecords()
-  await load()
+  await Promise.all([load(), loadNameservers()])
 }
 
 async function deleteRecord(id: number) {
   if (!confirm('Delete this DNS resolution record?')) return
   await apiFetch(`/dns/records/${id}`, { method: 'DELETE' })
   await refreshRecords()
-  await load()
+  await Promise.all([load(), loadNameservers()])
 }
 
 async function pullData() {
   pulling.value = true
   try {
     await apiFetch('/dns/zones/pull', { method: 'POST' })
-    await load()
+    await Promise.all([load(), loadNameservers()])
   } finally {
     pulling.value = false
   }
@@ -659,9 +1134,52 @@ async function deleteProvider(id: number) {
   await load()
 }
 
-function copyValue(val: string) {
-  navigator.clipboard?.writeText(val)
+async function runZoneCheck(z: any) {
+  healthLoading.value = true
+  healthError.value = ''
+  try {
+    const result = await apiFetch(`/dns/zones/${z.id}/check`, { method: 'POST' })
+    healthResult.value = result
+    healthCache.value = { ...healthCache.value, [z.id]: result }
+  } catch (err: any) {
+    healthError.value = err?.message || 'DNS check failed'
+  } finally {
+    healthLoading.value = false
+  }
 }
 
-onMounted(load)
+async function testZone(z: any) {
+  healthZone.value = z
+  healthResult.value = healthCache.value[z.id] || null
+  healthError.value = ''
+  showHealthModal.value = true
+  await runZoneCheck(z)
+}
+
+async function testAllZones() {
+  if (!zones.value.length) return
+  testingAll.value = true
+  try {
+    const results = await Promise.all(
+      zones.value.map(async (z) => {
+        try {
+          return [z.id, await apiFetch(`/dns/zones/${z.id}/check`, { method: 'POST' })] as const
+        } catch {
+          return [z.id, null] as const
+        }
+      })
+    )
+    const next = { ...healthCache.value }
+    for (const [id, result] of results) {
+      if (result) next[id] = result
+    }
+    healthCache.value = next
+  } finally {
+    testingAll.value = false
+  }
+}
+
+onMounted(async () => {
+  await Promise.all([load(), loadNameservers()])
+})
 </script>

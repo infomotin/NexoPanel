@@ -57,7 +57,11 @@ async def csrf_protection_middleware(request: Request, call_next):
     """Enforce Double-Submit CSRF verification on mutating cookie-authenticated requests."""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         has_cookie_auth = "access_token" in request.cookies
-        has_bearer = request.headers.get("Authorization", "").startswith("Bearer ")
+        auth_header = request.headers.get("Authorization", "").strip()
+        has_bearer = (
+            auth_header.startswith("Bearer ")
+            and auth_header[7:].strip().lower() not in {"null", "undefined", "none", ""}
+        )
         if has_cookie_auth and not has_bearer and not request.url.path.endswith("/auth/login"):
             cookie_csrf = request.cookies.get(settings.CSRF_COOKIE_NAME)
             header_csrf = request.headers.get(settings.CSRF_HEADER_NAME)

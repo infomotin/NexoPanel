@@ -43,6 +43,9 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/apt-get",
     "/usr/bin/dpkg-query",
     "/usr/sbin/named-checkzone",
+    "/usr/bin/named-checkzone",
+    "/usr/sbin/named-checkconf",
+    "/usr/bin/named-checkconf",
     "/usr/sbin/postsuper",
     "/usr/sbin/postqueue",
     "/usr/sbin/postmap",
@@ -56,6 +59,20 @@ ALLOWED_BINARIES: set[str] = {
     "/usr/bin/docker",
     "/bin/cp",
     "/usr/bin/cp",
+    "/usr/bin/apt-cache",
+    "/usr/bin/add-apt-repository",
+    "/usr/bin/git",
+    "/usr/bin/curl",
+    "/bin/tar",
+    "/usr/bin/tar",
+    "/usr/bin/make",
+    "/usr/bin/cmake",
+    "/usr/bin/python3",
+    "/usr/bin/which",
+    "/bin/sync",
+    "/usr/bin/sync",
+    "/bin/journalctl",
+    "/usr/bin/journalctl",
 }
 
 ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
@@ -68,6 +85,17 @@ ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
     "/var/www/",
     "/var/mail/vhosts/",
     "/var/backups/nexopanel/",
+)
+
+ALLOWED_LOG_PREFIXES: tuple[str, ...] = (
+    "/var/log/",
+    "/var/log/nginx/",
+    "/var/log/mysql/",
+    "/var/log/mariadb/",
+    "/var/log/postgresql/",
+    "/var/log/nexopanel/",
+    "/var/log/mail/",
+    "/var/log/fail2ban/",
 )
 
 # Root-only scratch directory is no longer needed: the control plane performs
@@ -95,7 +123,7 @@ CP_ALLOWED_PREFIXES: tuple[str, ...] = (
 )
 
 SERVICE_UNIT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,63}(\.service)?$")
-PACKAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.:-]{0,127}$")
+PACKAGE_NAME_RE = re.compile(r"^[a-z0-9*][a-z0-9+.:=~*-]{0,127}$")
 DB_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 ZONE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,253}$")
 DOCKER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
@@ -118,7 +146,7 @@ SYSTEMCTL_ACTIONS = {
     "reopenlogs",
 }
 
-APT_ACTIONS = {"update", "install", "remove", "purge", "upgrade", "--only-upgrade"}
+APT_ACTIONS = {"update", "install", "remove", "purge", "upgrade", "--only-upgrade", "clean", "autoremove"}
 APT_FLAGS = {"-y", "-q", "-qq", "--only-upgrade", "--allow-downgrades", "--allow-remove-essential"}
 
 NGINX_SIGNALS = {"reload", "reopen"}
@@ -131,6 +159,9 @@ DB_CLIENT_FLAGS = {
     "-N",
     "-s",
     "-A",
+    "-B",
+    "-F",
+    "-W",
     "-t",
     "--batch",
     "--skip-column-names",
@@ -145,8 +176,69 @@ DB_CLIENT_FLAGS = {
     "--field-separator",
 }
 
-DOCKER_ACTIONS = {"ps", "images", "pull", "start", "stop", "restart", "rm", "logs", "inspect"}
-DOCKER_FLAGS = {"-a", "--all", "--format", "-q", "--quiet", "--no-trunc", "--tail", "-f", "--follow"}
+DOCKER_ACTIONS = {
+    "ps",
+    "images",
+    "pull",
+    "start",
+    "stop",
+    "restart",
+    "rm",
+    "rmi",
+    "kill",
+    "pause",
+    "unpause",
+    "logs",
+    "inspect",
+    "stats",
+    "info",
+    "version",
+    "volume",
+    "network",
+    "system",
+    "run",
+    "compose",
+    "exec",
+}
+DOCKER_FLAGS = {
+    "-a",
+    "--all",
+    "-q",
+    "--quiet",
+    "--no-trunc",
+    "-f",
+    "--force",
+    "--follow",
+    "-t",
+    "--timestamps",
+    "-d",
+    "--detach",
+    "--no-stream",
+    "--volumes",
+    "-v",
+    "-i",
+}
+DOCKER_VALUE_FLAGS = {
+    "--format",
+    "--tail",
+    "-n",
+    "--name",
+    "-p",
+    "--publish",
+    "-v",
+    "--volume",
+    "-e",
+    "--env",
+    "--restart",
+    "--memory",
+    "--cpus",
+    "--network",
+    "-f",
+    "--file",
+    "--project-name",
+    "-d",
+    "--driver",
+}
 
 UFW_ACTIONS = {"status", "allow", "delete", "enable", "disable", "reload", "show"}
 CERTBOT_ACTIONS = {"certonly", "renew"}
@@ -268,6 +360,15 @@ def _validate_named_checkzone(args: list[str]) -> str | None:
     return None
 
 
+def _validate_named_checkconf(args: list[str]) -> str | None:
+    for arg in args:
+        if arg in ("-z", "-p", "-v"):
+            continue
+        if not _is_allowed_path(arg):
+            return f"Configuration file not permitted: {arg}"
+    return None
+
+
 def _validate_postmap(args: list[str]) -> str | None:
     if len(args) != 1 or not _is_allowed_path(args[0]):
         return "postmap expects a single permitted map file"
@@ -302,6 +403,9 @@ def _validate_db_client(args: list[str], *, allow_sql: bool = True) -> str | Non
     for arg in args:
         if skip_next:
             skip_next = False
+            if value_flag == "-F":
+                # Delimiter can be single character or escaped tab/comma
+                continue
             if value_flag is not None and not DB_IDENTIFIER_RE.match(arg):
                 return f"Invalid database identifier: {arg}"
             continue
@@ -311,7 +415,7 @@ def _validate_db_client(args: list[str], *, allow_sql: bool = True) -> str | Non
             skip_next = True
             value_flag = None
             continue
-        if arg in {"-U", "--username", "-d", "--dbname"}:
+        if arg in {"-U", "--username", "-d", "--dbname", "-F"}:
             skip_next = True
             value_flag = arg
             continue
@@ -396,26 +500,20 @@ def _validate_fail2ban(args: list[str]) -> str | None:
 def _validate_docker(args: list[str]) -> str | None:
     if not args or args[0] not in DOCKER_ACTIONS:
         return "Unsupported docker action"
-    value_flags = {"--format", "--tail"}
     expect_value = False
     for arg in args[1:]:
         if expect_value:
             expect_value = False
             continue
-        if arg in value_flags:
+        if arg in DOCKER_VALUE_FLAGS:
             expect_value = True
             continue
         if arg in DOCKER_FLAGS:
             continue
-        if arg.startswith("--format="):
+        if any(arg.startswith(f"{vf}=") for vf in DOCKER_VALUE_FLAGS):
             continue
         if _is_flag(arg):
             return f"Unsupported docker flag: {arg}"
-        if args[0] == "pull":
-            if not DOCKER_IMAGE_RE.match(arg):
-                return f"Invalid image reference: {arg}"
-        elif not DOCKER_NAME_RE.match(arg):
-            return f"Invalid container reference: {arg}"
     return None
 
 
@@ -442,6 +540,120 @@ def _validate_cp(args: list[str]) -> str | None:
     return None
 
 
+APT_CACHE_ACTIONS = {"search", "show", "policy", "pkgnames", "depends", "rdepends", "stats"}
+APT_CACHE_FLAGS = {"-q", "-qq", "--names-only", "-n", "--full", "--no-all-versions", "--recurse"}
+
+
+def _validate_apt_cache(args: list[str]) -> str | None:
+    if not args:
+        return "apt-cache requires an action"
+    action = args[0]
+    if action not in APT_CACHE_ACTIONS:
+        return f"Unsupported apt-cache action: {action}"
+    for arg in args[1:]:
+        if arg in APT_CACHE_FLAGS:
+            continue
+        if not re.match(r"^[a-zA-Z0-9.+:=-]{1,128}$", arg):
+            return f"Invalid apt-cache argument: {arg}"
+    return None
+
+
+def _validate_add_apt_repository(args: list[str]) -> str | None:
+    if not args:
+        return "add-apt-repository requires arguments"
+    for arg in args:
+        if arg in {"-y", "--yes", "-u", "--update", "-r", "--remove", "-s", "--sourceslist"}:
+            continue
+        if re.match(r"^ppa:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", arg) or arg.startswith("deb "):
+            continue
+        return f"Unsupported repository specification: {arg}"
+    return None
+
+
+def _validate_git(args: list[str]) -> str | None:
+    if not args:
+        return "git requires arguments"
+    action = args[0]
+    if action not in {"clone", "checkout", "pull", "fetch", "version", "--version", "rev-parse", "-c"}:
+        return f"Unsupported git action: {action}"
+    return None
+
+
+def _validate_curl(args: list[str]) -> str | None:
+    if not args:
+        return "curl requires arguments"
+    return None
+
+
+def _validate_tar(args: list[str]) -> str | None:
+    if not args:
+        return "tar requires arguments"
+    return None
+
+
+def _validate_make(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_cmake(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_python3(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_which(args: list[str]) -> str | None:
+    return None
+
+
+def _validate_journalctl(args: list[str]) -> str | None:
+    for arg in args:
+        if arg in ("--no-pager", "-f", "-q", "-e"):
+            continue
+        if arg.startswith("-u") or arg.startswith("-n") or arg.startswith("--unit=") or arg.startswith("--lines="):
+            continue
+        if re.match(r"^[0-9]+$", arg) or SERVICE_UNIT_RE.match(arg):
+            continue
+        return f"Unsupported journalctl argument: {arg}"
+    return None
+
+
+def _tail_log_file(p: Path, max_lines: int = 100, filter_text: str | None = None) -> list[str]:
+    """Read last N lines from a file efficiently."""
+    chunk_size = 64 * 1024
+    lines: list[str] = []
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            buffer = bytearray()
+            pos = file_size
+            while pos > 0 and buffer.count(b"\n") < max_lines * 2:
+                read_len = min(pos, chunk_size)
+                pos -= read_len
+                f.seek(pos)
+                chunk = f.read(read_len)
+                buffer = chunk + buffer
+            decoded = buffer.decode("utf-8", errors="replace")
+            all_lines = decoded.splitlines()
+            if filter_text:
+                q = filter_text.lower()
+                all_lines = [l for l in all_lines if q in l.lower()]
+            lines = all_lines[-max_lines:] if len(all_lines) > max_lines else all_lines
+    except Exception:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = [l.rstrip("\r\n") for l in f]
+                if filter_text:
+                    q = filter_text.lower()
+                    all_lines = [l for l in all_lines if q in l.lower()]
+                lines = all_lines[-max_lines:]
+        except Exception:
+            lines = []
+    return lines
+
+
 _EXEC_VALIDATORS = {
     "/bin/systemctl": _validate_systemctl,
     "/usr/bin/systemctl": _validate_systemctl,
@@ -449,6 +661,9 @@ _EXEC_VALIDATORS = {
     "/usr/bin/apt-get": _validate_apt_get,
     "/usr/bin/dpkg-query": _validate_dpkg_query,
     "/usr/sbin/named-checkzone": _validate_named_checkzone,
+    "/usr/bin/named-checkzone": _validate_named_checkzone,
+    "/usr/sbin/named-checkconf": _validate_named_checkconf,
+    "/usr/bin/named-checkconf": _validate_named_checkconf,
     "/usr/sbin/postmap": _validate_postmap,
     "/usr/sbin/postqueue": _validate_postqueue,
     "/usr/sbin/postsuper": _validate_postsuper,
@@ -462,6 +677,20 @@ _EXEC_VALIDATORS = {
     "/usr/bin/docker": _validate_docker,
     "/bin/cp": _validate_cp,
     "/usr/bin/cp": _validate_cp,
+    "/usr/bin/apt-cache": _validate_apt_cache,
+    "/usr/bin/add-apt-repository": _validate_add_apt_repository,
+    "/usr/bin/git": _validate_git,
+    "/usr/bin/curl": _validate_curl,
+    "/bin/tar": _validate_tar,
+    "/usr/bin/tar": _validate_tar,
+    "/usr/bin/make": _validate_make,
+    "/usr/bin/cmake": _validate_cmake,
+    "/usr/bin/python3": _validate_python3,
+    "/usr/bin/which": _validate_which,
+    "/bin/sync": lambda args: None,
+    "/usr/bin/sync": lambda args: None,
+    "/bin/journalctl": _validate_journalctl,
+    "/usr/bin/journalctl": _validate_journalctl,
 }
 
 
@@ -618,12 +847,15 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
         stdin_data = payload.get("stdin")
         if stdin_data is not None and not isinstance(stdin_data, str):
             return {"returncode": 1, "stdout": "", "stderr": "Invalid stdin payload"}
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return {"returncode": 127, "stdout": "", "stderr": f"Binary not found on system: {args[0]}"}
         try:
             out_b, err_b = await asyncio.wait_for(
                 proc.communicate(input=stdin_data.encode("utf-8") if stdin_data is not None else None),
@@ -902,6 +1134,47 @@ async def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
             return {"returncode": 1, "stdout": "", "stderr": f"Install failed: {exc.strerror or exc}"}
         _ensure_owner_accessible(dst, owner, group)
         return {"returncode": 0, "stdout": "installed", "stderr": ""}
+
+    if op == "read_log_file":
+        path_str = str(payload.get("path", ""))
+        lines_count = min(int(payload.get("lines", 100)), 2000)
+        filter_text = payload.get("filter")
+        if not _is_allowed_path(path_str, ALLOWED_LOG_PREFIXES):
+            return {"returncode": 1, "stdout": "", "stderr": f"Log path not permitted: {path_str}"}
+        p = Path(path_str)
+        if not p.exists() or not p.is_file():
+            return {"returncode": 1, "stdout": "", "stderr": f"Log file not found: {path_str}"}
+        lines = _tail_log_file(p, lines_count, filter_text)
+        return {
+            "returncode": 0,
+            "stdout": "\n".join(lines),
+            "stderr": "",
+            "file_size": p.stat().st_size,
+            "last_modified": p.stat().st_mtime,
+        }
+
+    if op == "clear_log_file":
+        path_str = str(payload.get("path", ""))
+        if not _is_allowed_path(path_str, ALLOWED_LOG_PREFIXES):
+            return {"returncode": 1, "stdout": "", "stderr": f"Log path not permitted: {path_str}"}
+        p = Path(path_str)
+        if not p.exists() or not p.is_file():
+            return {"returncode": 1, "stdout": "", "stderr": f"Log file not found: {path_str}"}
+        try:
+            p.write_text("", encoding="utf-8")
+            return {"returncode": 0, "stdout": "cleared", "stderr": ""}
+        except OSError as exc:
+            return {"returncode": 1, "stdout": "", "stderr": f"Clear failed: {exc}"}
+
+    if op == "drop_caches":
+        try:
+            subprocess.run(["/bin/sync"], check=False)
+            drop_path = Path("/proc/sys/vm/drop_caches")
+            if drop_path.exists():
+                drop_path.write_text("3\n")
+            return {"returncode": 0, "stdout": "caches dropped", "stderr": ""}
+        except Exception as exc:
+            return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
     return {"returncode": 1, "stdout": "", "stderr": f"Unknown operation: {op}"}
 

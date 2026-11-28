@@ -91,7 +91,7 @@ apt-get install -y -q \
   ca-certificates curl git tar unzip gnupg lsb-release \
   nginx php-fpm \
   postfix postfix-pcre dovecot-core dovecot-imapd dovecot-pop3d opendkim opendkim-tools \
-  bind9 bind9utils \
+  bind9 bind9-utils dnsutils \
   mariadb-server postgresql \
   pure-ftpd \
   ufw fail2ban \
@@ -109,9 +109,9 @@ chmod 750 "$NEXOPANEL_ETC"
 
 if [[ ! -f "${NEXOPANEL_ETC}/master.key" ]]; then
   python3 -c 'import secrets, base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())' > "${NEXOPANEL_ETC}/master.key"
-  chmod 0600 "${NEXOPANEL_ETC}/master.key"
-  chown nexopanel:nexopanel "${NEXOPANEL_ETC}/master.key"
 fi
+chmod 0640 "${NEXOPANEL_ETC}/master.key"
+chown root:nexopanel "${NEXOPANEL_ETC}/master.key"
 
 # 4. Acquire NexoPanel Source (Git Repo OR Local/Release Package)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,14 +121,20 @@ cd "$NEXOPANEL_HOME" || cd /tmp
 if [[ -n "$GIT_REPO" ]]; then
   log "Cloning/updating NexoPanel from Git repository: ${GIT_REPO} (${GIT_BRANCH})..."
   if [[ -d "${NEXOPANEL_HOME}/.git" ]]; then
-    git -C "$NEXOPANEL_HOME" fetch --all --prune
-    git -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
-    git -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" fetch --all --prune
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" checkout "$GIT_BRANCH"
+    git -c "safe.directory=${NEXOPANEL_HOME}" -C "$NEXOPANEL_HOME" pull --ff-only origin "$GIT_BRANCH"
   else
     rm -rf "${NEXOPANEL_HOME:?}/backend" "${NEXOPANEL_HOME:?}/frontend"
     git clone --branch "$GIT_BRANCH" --depth 1 "$GIT_REPO" "$NEXOPANEL_HOME"
   fi
   REBUILD_FRONTEND=1
+elif [[ "$REPO_ROOT" == "$NEXOPANEL_HOME" ]]; then
+  # Running the installer from the installed checkout itself (e.g. after a
+  # `git pull`). Copying the tree onto itself would delete backend/ before it
+  # could be read, so use the in-place sources and just rebuild the frontend.
+  log "Using in-place sources from ${NEXOPANEL_HOME}..."
+  [[ -d "${NEXOPANEL_HOME}/.git" ]] && REBUILD_FRONTEND=1
 elif [[ -d "${REPO_ROOT}/backend" ]]; then
   log "Installing/updating NexoPanel from local source (${REPO_ROOT})..."
   rm -rf "${NEXOPANEL_HOME}/backend"
@@ -242,18 +248,57 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now nginx mariadb postgresql postfix dovecot named fail2ban
-systemctl enable --now pure-ftpd >/dev/null 2>&1 || true
-systemctl enable nexopanel-daemon nexopanel
-systemctl restart nexopanel-daemon nexopanel
+# Pre-configure services to prevent startup hangs (Ubuntu 22.04/24.04 & Debian 12 compatibility)
+log "Configuring service runtime environments..."
+mkdir -p /var/run/fail2ban /run/fail2ban /var/log /etc/fail2ban/jail.d
+rm -f /var/run/fail2ban/fail2ban.sock /run/fail2ban/fail2ban.sock /var/run/fail2ban/fail2ban.pid /run/fail2ban/fail2ban.pid
+touch /var/log/auth.log 2>/dev/null || true
 
-# Open panel port in UFW if active
-if ufw status | grep -q "Status: active"; then
-  ufw allow 8443/tcp >/dev/null 2>&1 || true
+# Disable DNS resolution in fail2ban to avoid reverse-DNS startup hangs
+cat > /etc/fail2ban/jail.d/00-nexopanel.conf <<'F2BEOF'
+[DEFAULT]
+usedns = no
+F2BEOF
+
+# Ensure Pure-FTPd runs in standalone mode rather than inetd
+if [[ -f /etc/default/pure-ftpd-common ]]; then
+  sed -i 's/STANDALONE_OR_INETD=.*/STANDALONE_OR_INETD=standalone/' /etc/default/pure-ftpd-common 2>/dev/null || true
+fi
+rm -f /var/run/pure-ftpd.pid /run/pure-ftpd.pid 2>/dev/null || true
+
+log "Reloading systemd daemon..."
+systemctl daemon-reload
+
+log "Enabling system services (non-blocking)..."
+SERVICES=(nginx mariadb postgresql postfix dovecot named bind9 fail2ban pure-ftpd nexopanel-daemon nexopanel)
+for svc in "${SERVICES[@]}"; do
+  timeout 5 systemctl enable "$svc" < /dev/null >/dev/null 2>&1 || true
+done
+
+log "Starting delegating system services with timeout guards..."
+START_SERVICES=(nginx mariadb postgresql postfix dovecot named fail2ban pure-ftpd)
+for svc in "${START_SERVICES[@]}"; do
+  log " - Starting ${svc}..."
+  if ! timeout 15 systemctl restart "$svc" >/dev/null 2>&1; then
+    # Fallback to non-blocking start if synchronous restart timed out
+    systemctl start --no-block "$svc" >/dev/null 2>&1 || true
+  fi
+done
+
+log "Starting NexoPanel core services..."
+timeout 15 systemctl restart nexopanel-daemon >/dev/null 2>&1 || systemctl start --no-block nexopanel-daemon >/dev/null 2>&1 || true
+sleep 1
+timeout 15 systemctl restart nexopanel >/dev/null 2>&1 || systemctl start --no-block nexopanel >/dev/null 2>&1 || true
+
+# Open panel port in UFW if active (guarded with timeout)
+if command -v ufw >/dev/null 2>&1; then
+  if timeout 5 ufw status 2>/dev/null | grep -q "Status: active"; then
+    timeout 5 ufw allow 8443/tcp >/dev/null 2>&1 || true
+  fi
 fi
 
-SERVER_IP="$(hostname -I | awk '{print $1}')"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="127.0.0.1"
 echo ""
 log "========================================================"
 log " NexoPanel Installation / Upgrade Complete!"

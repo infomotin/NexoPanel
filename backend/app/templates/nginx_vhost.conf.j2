@@ -7,6 +7,9 @@ server {
     root {{ document_root }};
     index index.php index.html index.htm;
 
+    access_log /var/log/nginx/{{ domain }}.access.log combined;
+    error_log /var/log/nginx/{{ domain }}.error.log warn;
+
     location ^~ /.well-known/acme-challenge/ {
         alias /var/www/acme-challenge/.well-known/acme-challenge/;
         default_type "text/plain";
@@ -64,6 +67,9 @@ server {
 
     root {{ document_root }};
     index index.php index.html index.htm;
+
+    access_log /var/log/nginx/{{ domain }}.access.log combined;
+    error_log /var/log/nginx/{{ domain }}.error.log warn;
 
     {% if runtime_type == 'proxy' and proxy_upstream %}
     location / {
